@@ -72,7 +72,13 @@ for v in CONTEXT PARALLEL MAX_TOKENS TOP_K; do [[ "${!v}" =~ ^[1-9][0-9]*$ ]] ||
 [[ "$PREFILL_INTERLEAVE_MS" =~ ^[0-9]+$ ]] && (( PREFILL_INTERLEAVE_MS <= 5000 )) || die "PREFILL_INTERLEAVE_MS is 0 to 5000 milliseconds, not $PREFILL_INTERLEAVE_MS"
 [[ -z "$LOG_MAX_SIZE" || "$LOG_MAX_SIZE" =~ ^[1-9][0-9]*[kmg]$ ]] || die "LOG_MAX_SIZE is a size such as 100m (k, m or g), or empty for the docker daemon's own setting, not $LOG_MAX_SIZE"
 [[ "$LOG_MAX_FILE" =~ ^[1-9][0-9]*$ ]] || die "LOG_MAX_FILE is a number of files, 1 or more, not $LOG_MAX_FILE"
-for v in EAQ_V1_1 THINKING DRAFTS RDMA GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in EAQ_V1_1 THINKING DRAFTS GRAPHS SIDE PREFETCH ENGRAM_AIO REPLAY_FLOOR API_KEY; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+[[ "$RDMA" =~ ^(0|1|auto)$ ]] || die "RDMA is 0, 1 or auto, not $RDMA"
+[[ "$MGBE_ZC" =~ ^(auto|on|off)$ ]] || die "MGBE_ZC is auto, on or off, not $MGBE_ZC"
+[[ "$MGBE_ZC_MAX_KB" =~ ^[1-9][0-9]*$ ]] || die "MGBE_ZC_MAX_KB is a positive KiB size, not $MGBE_ZC_MAX_KB"
+[[ "$MGBE_ZC_EAGER_KB" =~ ^[0-9]+$ ]] || die "MGBE_ZC_EAGER_KB is a KiB threshold, not $MGBE_ZC_EAGER_KB"
+[[ "$GPU_RUNTIME" =~ ^(auto|gpus|runtime)$ ]] || die "GPU_RUNTIME is auto, gpus or runtime, not $GPU_RUNTIME"
+[[ "$FABRIC_MIN_SPEED_MBPS" =~ ^[0-9]+$ ]] || die "FABRIC_MIN_SPEED_MBPS is a link speed in Mb/s (0: no floor), not $FABRIC_MIN_SPEED_MBPS"
 [[ "$GRAPH_CAP" =~ ^[0-9]+$ ]] || die "GRAPH_CAP is a count of CUDA graphs a rank keeps, 0 for all, not $GRAPH_CAP"
 [[ "$RDMA_IDLE_S" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk -v value="$RDMA_IDLE_S" 'BEGIN { exit !(value <= 3600) }' || die "RDMA_IDLE_S is 0 to 3600 seconds (0 turns the nap off), not $RDMA_IDLE_S"
 [[ "$RDMA_NAP_US" =~ ^[1-9][0-9]*$ ]] && awk -v value="$RDMA_NAP_US" 'BEGIN { exit !(value <= 1000000) }' || die "RDMA_NAP_US is 1 to 1000000 microseconds, not $RDMA_NAP_US"
@@ -193,10 +199,22 @@ if [[ -n "$HEAD_ENGRAM_DIR" ]] && (( ! DRY )); then
   done
 fi
 detect_links
+detect_mgbe_zc
+[[ "$RDMA" != auto ]] || RDMA=$([[ "${LINK_KIND:-ib}" == tcp ]] && echo 0 || echo 1)
 log "Link: rendezvous $MASTER_ADDR:$MASTER_PORT"
 for r in 0 1; do
-  log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
+  if [[ "${LINK_KIND:-ib}" == tcp ]]; then
+    if [[ "$MGBE_ZC" == on ]]; then
+      _zp=$( (( r == 0 )) && echo "${MGBE_ZC_PORTS:-$LINK_ZC_PORTS}" || echo "${MGBE_ZC_PORTS:-$WORKER_ZC_PORTS}" )
+      log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): Ethernet ${NODE_DEV[r]} (/dev/mgbe_zc ports $_zp, max ${MGBE_ZC_MAX_KB} KiB, eager <= ${MGBE_ZC_EAGER_KB} KiB/rail)$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
+    else
+      log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): Ethernet ${NODE_DEV[r]} (NCCL Socket TCP, RDMA/mgbe_zc off)$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
+    fi
+  else
+    log "  rank $r ($( (( r == 0 )) && echo this node || worker_host "$r")): RoCE ${NODE_HCAS[r]} (GID ${NODE_GID[r]})$( (( r == 0 )) || echo ", NFS from ${LINK_HEAD_ADDR[r]:-?}")"
+  fi
 done
+unset _zp
 # the serve flags against what this build of tensorfold-native serves (scripts/zig_flags.py, from the GLM-5.3-Flash recipe):
 # the binary refuses an unsupported flag at start, after the container is up and the old server stopped
 if docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -271,11 +289,27 @@ ENGINE_ENV=("TF_DS_REPLAY_FLOOR=$REPLAY_FLOOR" "TF_DS_STREAMS=$PARALLEL" "TF_RDM
 (( PREFILL_INTERLEAVE_MS == 0 )) || ENGINE_ENV+=("TF_DS_PREFILL_INTERLEAVE_MS=$PREFILL_INTERLEAVE_MS")
 ENGINE_ENV+=(${PORT_ENV[@]+"${PORT_ENV[@]}"})   # the ported features' variables, the same on both ranks (scripts/port.sh)
 ENGINE_ENV+=(${PORT_IDENT_ENV[@]+"${PORT_IDENT_ENV[@]}"})   # the spill tier's identity, the same on both ranks
-while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
+if [[ "${LINK_KIND:-ib}" == tcp ]]; then
+  ENGINE_ENV+=("TF_MGBE_ZC=$([[ "$MGBE_ZC" == on ]] && echo 1 || echo 0)")
+  if [[ "$MGBE_ZC" == on ]]; then
+    ENGINE_ENV+=("TF_MGBE_ZC_MAX_KB=$MGBE_ZC_MAX_KB" "TF_MGBE_ZC_EAGER_KB=$MGBE_ZC_EAGER_KB")
+    [[ -z "$MGBE_ZC_CPUS" ]] || ENGINE_ENV+=("TF_MGBE_ZC_CPUS=$MGBE_ZC_CPUS")
+  fi
+fi
+while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL|TF_MGBE_ZC)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE '^TF_MGBE_ZC_(MAX_KB|EAGER_KB|PORTS|CPUS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)
 envs() { local x; for x in "$@"; do printf -- '-e %q ' "$x"; done; }
-RUN_ARGS="--label tf.recipe.ablit=$(ablit_identity) --label tf.recipe.port=$(port_identity) --gpus all --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK --device /dev/infiniband"
+RUN_ARGS_COMMON=(--label "tf.recipe.ablit=$(ablit_identity)" --label "tf.recipe.port=$(port_identity)" --ipc=host --network host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK)
 # each rank's container log rotates (LOG_MAX_SIZE, LOG_MAX_FILE; issue #49): the engine logs every response
-[[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS+=" --log-driver json-file --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
+[[ -z "$LOG_MAX_SIZE" ]] || RUN_ARGS_COMMON+=(--log-driver json-file --log-opt "max-size=$LOG_MAX_SIZE" --log-opt "max-file=$LOG_MAX_FILE")
+mapfile -t GPU_ARGS_HEAD < <(gpu_args '')
+mapfile -t GPU_ARGS_WORKER < <(gpu_args worker)
+mapfile -t IB_ARGS_HEAD < <(infiniband_args '')
+mapfile -t IB_ARGS_WORKER < <(infiniband_args worker)
+mapfile -t ZC_ARGS_HEAD < <(mgbe_zc_args '')
+mapfile -t ZC_ARGS_WORKER < <(mgbe_zc_args worker)
+RUN_ARGS_HEAD=("${RUN_ARGS_COMMON[@]}" "${GPU_ARGS_HEAD[@]}" "${IB_ARGS_HEAD[@]}" "${ZC_ARGS_HEAD[@]}")
+RUN_ARGS_WORKER=("${RUN_ARGS_COMMON[@]}" "${GPU_ARGS_WORKER[@]}" "${IB_ARGS_WORKER[@]}" "${ZC_ARGS_WORKER[@]}")
+shq_args() { local x; for x in "$@"; do if [[ "$x" =~ ^[A-Za-z0-9_.,:=/@%+-]+$ ]]; then printf '%s ' "$x"; else printf '%q ' "$x"; fi; done; }
 DATA=/hf/$DATA_SUB
 KIT=/hf/$KIT_SUB/kit
 # rank 1 takes the round's settings as flags only (tf-dsv41-lanes reads no TF_DS_GRAPHS & co.): without them it runs
@@ -311,7 +345,10 @@ step 3 "Launch: container $CONTAINER_NAME, rank 1 on the worker, then rank 0 her
 cmd="tf-dsv41-lanes $MODEL_ARG /rank-cache 1 2 ${LINK_HEAD_ADDR[1]:-$MASTER_ADDR} $MASTER_PORT $KIT --engram /engram --token-map $DATA/dsv41_token_map.json $FOLLOW"
 [[ "$RDMA" == 0 ]] || cmd+=" --rdma ${NODE_HCAS[1]}"   # this node's RoCE devices
 spill1=$(port_spill_args 1)   # rank 1's spill directory (scripts/port.sh; empty, and no extra space, with it off)
-remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $RUN_ARGS -v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" "TF_RDMA_GID_INDEX=${NODE_GID[1]}" ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
+worker_rdma_env=(); [[ "$RDMA" == 0 ]] || worker_rdma_env=("TF_RDMA_GID_INDEX=${NODE_GID[1]}")
+_wzp="${MGBE_ZC_PORTS:-$WORKER_ZC_PORTS}"
+[[ "$MGBE_ZC" != on || -z "$_wzp" ]] || worker_rdma_env+=("TF_MGBE_ZC_PORTS=$_wzp")
+remote="mkdir -p \$HOME/.cache/dsv41-tensorfold && docker run -d --name $CONTAINER_NAME $(shq_args "${RUN_ARGS_WORKER[@]}")-v $NFS_VOLUME:/hf:ro -v $WORKER_ENGRAM_DIR:/engram:ro -v $WORKER_CACHE_DIR:/rank-cache:ro ${spill1:+$spill1 }$(envs "${ENGINE_ENV[@]}" ${worker_rdma_env[@]+"${worker_rdma_env[@]}"} ${PORT_RANK_SHA[1]:+"TF_DS_RANK_CACHE_SHA=${PORT_RANK_SHA[1]}"} ${PORT_RANK1_ENV[@]+"${PORT_RANK1_ENV[@]}"}) $(rank_nccl_env 1) $IMAGE $cmd"
 if (( DRY )); then printf '[dry-run] rank 1 on %s:\n  %s\n' "$(worker_host 1)" "$remote"
 else
   log "Rank 1 on $(worker_host 1): $cmd"
@@ -319,9 +356,13 @@ else
 fi
 ENV0=(TF_TP_WORLD=2 "TF_TP_MASTER=${LINK_HEAD_ADDR[1]:-$MASTER_ADDR}" "TF_TP_PORT=$MASTER_PORT" "TF_DS_RANK_CACHE=$DATA/rank-cache" "TF_DS_KIT=$KIT"
       "TENSORFOLD_CUDA_KERNELS=$KIT/aot" "TF_DS_ENGRAM=$([[ -n "$HEAD_ENGRAM_DIR" ]] && echo /engram || engram_in_container)" "TF_DS_TOKEN_MAP=$DATA/dsv41_token_map.json"
-      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO" "TF_RDMA_GID_INDEX=${NODE_GID[0]}")
+      "TF_DS_GRAPHS=$GRAPHS" "TF_DS_GRAPH_CAP=$GRAPH_CAP" "TF_DS_HC_SIDE=$SIDE" "TF_DS_L2_PREFETCH=$PREFETCH" "TF_DS_ENGRAM_AIO=$ENGRAM_AIO")
+[[ "$RDMA" == 0 ]] || ENV0+=("TF_RDMA_GID_INDEX=${NODE_GID[0]}")
+_hzp="${MGBE_ZC_PORTS:-$LINK_ZC_PORTS}"
+[[ "$MGBE_ZC" != on || -z "$_hzp" ]] || ENV0+=("TF_MGBE_ZC_PORTS=$_hzp")
+unset _wzp _hzp
 if (( DRY )); then HEAD_HF=${HEAD_NFS_SERVER:+$HEAD_NFS_VOLUME}; HEAD_HF=${HEAD_HF:-$HF_CACHE}; else HEAD_HF=$(head_hf_mount); fi
-here=(docker run -d --name "$CONTAINER_NAME" $RUN_ARGS -v "$HEAD_HF:/hf:ro")
+here=(docker run -d --name "$CONTAINER_NAME" "${RUN_ARGS_HEAD[@]}" -v "$HEAD_HF:/hf:ro")
 read -ra port0 <<<"$(port_spill_args 0)"; here+=(${port0[@]+"${port0[@]}"})   # rank 0's spill directory (scripts/port.sh)
 if [[ -n "$HEAD_ENGRAM_DIR" ]]; then
   here+=(-v "$HEAD_ENGRAM_DIR:/engram:ro")

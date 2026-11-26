@@ -1,0 +1,2728 @@
+Add /dev/mgbe_zc 4x25GbE zero-copy TP=2 backend behind dsv41/rdma.Ring for Jetson AGX Thor.
+
+Plugs /dev/mgbe_zc (CUDA VMM CU_MEM_LOCATION_TYPE_HOST_NUMA single-region staging + 4-rail
+VDMA 2 eager / VDMA 3 SPH=1 hardware DDP) behind dsv41/rdma.Ring so dsv41_rdma.cu and
+dsv41_shard.cu (sendRows/recvRows) run unchanged with full CUDA-Graph and PDL support.
+Also routes prefill/Engram/head gathers through Ring.gatherChunked when mgbe_zc is active
+(leaving DGX Spark RoCE + NCCL behavior unchanged) and adds mgbe_zc mode to tf-dsv41-rdma-bench.
+
+Switches (both ranks):
+  TF_MGBE_ZC=1|0 (default: auto when TP=2 on Linux and no RDMA devices)
+  TF_MGBE_ZC_MAX_KB (default: 20480, 20 MiB per rank)
+  TF_MGBE_ZC_EAGER_KB (default: 32, per-rail eager vs DDP threshold)
+  TF_MGBE_ZC_PORTS, TF_MGBE_ZC_CPUS, TF_MGBE_ZC_TIMEOUT_S, TF_MGBE_ZC_ARRIVAL_TIMEOUT_S, TF_MGBE_ZC_DEBUG
+
+---
+ zig/src/cuda/abi.zig                       |   40 +
+ zig/src/cuda/driver.zig                    |   13 +-
+ zig/src/cuda/mgbe_zc_uapi.zig              |  111 ++
+ zig/src/cuda/root.zig                      |    2 +
+ zig/src/families/dsv41/dsv41.zig           |    2 +
+ zig/src/families/dsv41/mgbe_zc.zig         | 2013 ++++++++++++++++++++++++++++
+ zig/src/families/dsv41/model.zig           |   81 +-
+ zig/src/families/dsv41/prompt.zig          |   23 +-
+ zig/src/families/dsv41/rdma.zig            |  134 +-
+ zig/src/families/dsv41/rdma_bench_main.zig |   54 +-
+ 10 files changed, 2442 insertions(+), 31 deletions(-)
+
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 97e048c..9ac62e4 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -209,6 +209,46 @@ pub const Api = struct {
+     cuGetErrorString: *const fn (R, *?[*:0]const u8) callconv(.c) R,
+ };
+ 
++/// CUDA Virtual Memory Management (VMM) types & optional entry points for CU_MEM_LOCATION_TYPE_HOST_NUMA.
++pub const cu_mem_allocation_type_pinned: c_int = 1;
++pub const cu_mem_location_type_device: c_int = 1;
++pub const cu_mem_location_type_host_numa: c_int = 3;
++pub const cu_mem_access_flags_prot_readwrite: c_int = 3;
++pub const cu_mem_alloc_granularity_minimum: c_int = 0;
++
++pub const MemLocation = extern struct {
++    type: c_int = 0,
++    id: c_int = 0,
++};
++
++pub const MemAllocationProp = extern struct {
++    type: c_int = 0,
++    requested_handle_types: c_int = 0,
++    location: MemLocation = .{},
++    win32_handle_meta_data: ?*anyopaque = null,
++    compression_type: u8 = 0,
++    gpu_direct_rdma_capable: u8 = 0,
++    usage: u16 = 0,
++    reserved: [4]u8 = @splat(0),
++};
++
++pub const MemAccessDesc = extern struct {
++    location: MemLocation = .{},
++    flags: c_int = 0,
++};
++
++pub const VmmApi = struct {
++    cuCtxGetDevice: *const fn (*Device) callconv(.c) R,
++    cuMemGetAllocationGranularity: *const fn (*usize, *const MemAllocationProp, c_int) callconv(.c) R,
++    cuMemCreate: *const fn (*u64, usize, *const MemAllocationProp, u64) callconv(.c) R,
++    cuMemAddressReserve: *const fn (*u64, usize, usize, u64, u64) callconv(.c) R,
++    cuMemMap: *const fn (u64, usize, usize, u64, u64) callconv(.c) R,
++    cuMemSetAccess: *const fn (u64, usize, [*]const MemAccessDesc, usize) callconv(.c) R,
++    cuMemUnmap: *const fn (u64, usize) callconv(.c) R,
++    cuMemAddressFree: *const fn (u64, usize) callconv(.c) R,
++    cuMemRelease: *const fn (u64) callconv(.c) R,
++};
++
+ comptime {
+     const std = @import("std");
+     std.debug.assert(@sizeOf(LaunchAttribute) == 72 and @offsetOf(LaunchAttribute, "value") == 8);
+diff --git a/zig/src/cuda/driver.zig b/zig/src/cuda/driver.zig
+index 79bc6ec..9519ce5 100644
+--- a/zig/src/cuda/driver.zig
++++ b/zig/src/cuda/driver.zig
+@@ -8,6 +8,17 @@ pub const Error = error{ DriverUnavailable, MissingSymbol, CudaFailed, OutOfDevi
+ pub const Driver = struct {
+     lib: std.DynLib,
+     api: abi.Api,
++    /// CUDA VMM entry points (optional; used by mgbe_zc for CU_MEM_LOCATION_TYPE_HOST_NUMA zero-copy regions).
++    vmm: ?abi.VmmApi = null,
++
++    fn lookupVmm(lib: *std.DynLib) ?abi.VmmApi {
++        var v: abi.VmmApi = undefined;
++        const info = @typeInfo(abi.VmmApi).@"struct";
++        inline for (info.field_names, info.field_types) |name, T| {
++            @field(v, name) = lib.lookup(T, name) orelse return null;
++        }
++        return v;
++    }
+ 
+     pub fn open() Error!Driver {
+         return openPath("libcuda.so.1");
+@@ -41,7 +52,7 @@ pub const Driver = struct {
+                 if (get(name, &p, 12000, 0, &status) == abi.success and status == 0 and p != null) @field(api, name) = @ptrCast(@alignCast(p.?));
+             }
+         };
+-        return .{ .lib = lib, .api = api };
++        return .{ .lib = lib, .api = api, .vmm = lookupVmm(&lib) };
+     }
+ 
+     pub fn close(self: *Driver) void {
+diff --git a/zig/src/cuda/mgbe_zc_uapi.zig b/zig/src/cuda/mgbe_zc_uapi.zig
+new file mode 100644
+index 0000000..34c6c40
+--- /dev/null
++++ b/zig/src/cuda/mgbe_zc_uapi.zig
+@@ -0,0 +1,111 @@
++//! Userspace ABI for /dev/mgbe_zc (Tegra264 zero-copy 4x25GbE MGBE driver), matching mgbe_zc_uapi.h.
++const std = @import("std");
++
++pub const dev_path: [:0]const u8 = "/dev/mgbe_zc";
++
++pub const max_ports: usize = 4;
++pub const queues_per_port: usize = 2; // qidx 0: VDMA 2 (ctrl/eager), qidx 1: VDMA 3 (DDP data)
++pub const ring_desc_cnt: u32 = 4096;
++pub const ring_mask: u32 = ring_desc_cnt - 1;
++pub const ring_bytes: usize = @as(usize, ring_desc_cnt) * 16; // 64 KiB
++pub const reg_map_bytes: usize = 4096;
++
++pub const ethtype_ctrl: u16 = 0x88B5; // FRP entry 0 -> VDMA 2 (qidx 0)
++pub const ethtype_data: u16 = 0x88B6; // FRP entry 1 -> VDMA 3 (qidx 1)
++
++pub const ch_tdtlp: usize = 0x24; // TX tail pointer doorbell
++pub const ch_rdtlp: usize = 0x2C; // RX tail pointer doorbell
++
++pub const desc_own: u32 = 1 << 31;
++pub const desc_ctxt: u32 = 1 << 30;
++pub const desc_fd: u32 = 1 << 29;
++pub const desc_ld: u32 = 1 << 28;
++
++pub const rdes3_es_mgbe: u32 = 1 << 15;
++pub const rdes3_pl_mask: u32 = 0x00003FFF;
++
++pub const tdes2_b1l_mask: u32 = 0x00003FFF;
++pub const tdes3_fl_mask: u32 = 0x00007FFF;
++
++pub const HwDesc = extern struct {
++    d0: u32,
++    d1: u32,
++    d2: u32,
++    d3: u32,
++};
++
++pub const PortInfo = extern struct {
++    port: u32 = 0,
++    present: u32 = 0,
++    ifname: [16]u8 = @splat(0),
++    mac: [6]u8 = @splat(0),
++    pad0: [2]u8 = @splat(0),
++    link_up: u32 = 0,
++    mtu: u32 = 0,
++    sph_supported: u32 = 0,
++    hw_chan: [queues_per_port]u32 = @splat(0),
++    pdma_chan: [queues_per_port]u32 = @splat(0),
++    reg_page_off: u32 = 0,
++    ring_desc_cnt: u32 = 0,
++};
++
++pub const QueueAlloc = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    tx_ring_iova: u64 = 0,
++    rx_ring_iova: u64 = 0,
++    mmap_tx_off: u64 = 0,
++    mmap_rx_off: u64 = 0,
++    mmap_reg_off: u64 = 0,
++    ch_reg_off: u32 = 0,
++    hw_chan: u32 = 0,
++};
++
++pub const QueueStart = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    rx_buf_size: u32 = 0,
++    sph_enable: u32 = 0,
++    sph_split_bytes: u32 = 0,
++    init_rx_tail_idx: u32 = 0,
++    cur_tx_desc_lo: u32 = 0,
++    cur_rx_desc_lo: u32 = 0,
++};
++
++pub const QueueStop = extern struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++};
++
++pub const MrReq = extern struct {
++    va: u64 = 0,
++    len: u64 = 0,
++    dmabuf_fd: i32 = -1,
++    flags: u32 = 0,
++    mr_id: u32 = 0,
++    nents: [max_ports]u32 = @splat(0),
++    iova: [max_ports]u64 = @splat(0),
++    first_seg_len: [max_ports]u64 = @splat(0),
++};
++
++fn iowr(comptime nr: u8, comptime T: type) u32 {
++    return (@as(u32, 3) << 30) | (@as(u32, @sizeOf(T)) << 16) | (@as(u32, 'Z') << 8) | @as(u32, nr);
++}
++
++pub const ioc_port_info: u32 = iowr(1, PortInfo);
++pub const ioc_queue_alloc: u32 = iowr(2, QueueAlloc);
++pub const ioc_queue_start: u32 = iowr(3, QueueStart);
++pub const ioc_queue_stop: u32 = iowr(4, QueueStop);
++pub const ioc_reg_mr: u32 = iowr(5, MrReq);
++pub const ioc_dereg_mr: u32 = iowr(6, u32);
++pub const ioc_port_reinit: u32 = iowr(7, u32);
++
++comptime {
++    std.debug.assert(@sizeOf(HwDesc) == 16);
++    std.debug.assert(@sizeOf(PortInfo) == 68);
++    std.debug.assert(@sizeOf(QueueAlloc) == 56);
++    std.debug.assert(@sizeOf(QueueStart) == 32);
++    std.debug.assert(@sizeOf(QueueStop) == 8);
++    std.debug.assert(@sizeOf(MrReq) == 112);
++    std.debug.assert(@offsetOf(MrReq, "iova") == 48);
++}
+diff --git a/zig/src/cuda/root.zig b/zig/src/cuda/root.zig
+index dc1cf52..75bf436 100644
+--- a/zig/src/cuda/root.zig
++++ b/zig/src/cuda/root.zig
+@@ -19,6 +19,7 @@ pub const Dim3 = launch.Dim3;
+ pub const graph = @import("graph.zig");
+ pub const cublaslt = @import("cublaslt.zig");
+ pub const nccl = @import("nccl.zig");
++pub const mgbe_zc_uapi = @import("mgbe_zc_uapi.zig");
+ pub const triton = @import("triton.zig");
+ pub const aot = @import("aot.zig");
+ pub const kernels = @import("kernels.zig");
+@@ -28,6 +29,7 @@ test {
+     _ = @import("memory.zig");
+     _ = launch;
+     _ = abi;
++    _ = mgbe_zc_uapi;
+     _ = aot;
+     _ = segments;
+ }
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 27c9fb2..7ef7f90 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -35,6 +35,7 @@ pub const exl3_experts_rec = @import("exl3_experts_rec.zig");
+ pub const prompt = @import("prompt.zig");
+ pub const exact = @import("exact.zig");
+ pub const rdma_seq = @import("rdma_seq.zig");
++pub const mgbe_zc = @import("mgbe_zc.zig");
+ pub const rdma = @import("rdma.zig");
+ pub const rdma_env = @import("rdma_env.zig");
+ pub const exl3_experts2d = @import("exl3_experts2d.zig");
+@@ -92,6 +93,7 @@ test {
+     refAll(prompt);
+     refAll(exact);
+     refAll(rdma_seq);
++    refAll(mgbe_zc);
+     refAll(rdma);
+     refAll(rdma_env);
+     refAll(exl3_experts2d);
+diff --git a/zig/src/families/dsv41/mgbe_zc.zig b/zig/src/families/dsv41/mgbe_zc.zig
+new file mode 100644
+index 0000000..b35aa6a
+--- /dev/null
++++ b/zig/src/families/dsv41/mgbe_zc.zig
+@@ -0,0 +1,2013 @@
++//! Two-rank TP all-gather & sized row exchange over /dev/mgbe_zc (4x25GbE zero-copy MGBE on Jetson AGX Thor),
++//! plugged behind dsv41/rdma.Ring so dsv41_rdma.cu (stage/collect/collect_into) and dsv41_shard.cu
++//! (tf_ds_ring_stage_rows/collect_rows) run unchanged with full CUDA-Graph and PDL support.
++//!
++//! Uses a single CUDA VMM CU_MEM_LOCATION_TYPE_HOST_NUMA region (holding send, recv, and meta) registered once across
++//! all active MGBE ports for contiguous 48-bit SMMU IOVA:
++//!   - Small stripes (<= TF_MGBE_ZC_EAGER_KB, default 32 KiB/rail): 0.5-RTT raw L2 eager frames on VDMA 2 (0x88B5)
++//!     with zero handshake (~4-6 us 1-way wire latency for decode/verify gathers).
++//!   - Bulk stripes (> TF_MGBE_ZC_EAGER_KB, up to TF_MGBE_ZC_MAX_KB default 20 MiB/rank): hardware split-header
++//!     DDP (SPH=1, 64B header + 8192B payload) directly into recv[slot][peer] SMMU IOVA on VDMA 3 (0x88B6) with
++//!     RTS/CTS/ACK and Go-Back-N retransmit (~90 Gbps across 4 rails for prefill gathers).
++//!   - Asymmetric TX/RX sizes (including 0-byte sides for TF_DS_KV_SHARD sendRows/recvRows) are handled natively per
++//!     direction: eager TX carries peer's exact nbytes in the header, bulk TX announces nbytes via RTS.
++const std = @import("std");
++const builtin = @import("builtin");
++const cuda = @import("cuda");
++const abi = cuda.abi;
++const Driver = cuda.Driver;
++const uapi = cuda.mgbe_zc_uapi;
++
++pub const max_ports = uapi.max_ports;
++pub const default_slots: u32 = 2;
++const max_slots: usize = 16;
++const flag_retrans: u8 = 1;
++
++const hdr_bytes: usize = 64;
++const max_payload: usize = 8192;
++const ctrl_rx_stride: usize = 9216; // holds full 64B hdr + 8192B eager jumbo frame (64B aligned)
++const data_rx_stride: usize = 256; // SPH=1 splits 64B header here; 8192B payload lands directly in CUDA HOST_NUMA
++const tx_batch_pkts: u32 = 16;
++const bulk_win_max_pkts: u32 = 512; // 4 MiB per DDP window (fits multiple recovery postings inside 4096-desc ring)
++const wire_magic: u32 = 0x5A433247; // 'ZC2G'
++const pr_set_name: c_int = 15;
++const pr_set_timerslack: c_int = 29;
++
++extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
++
++// Per-port anonymous mmap pool layout (40 MiB):
++//   [0 .. 256 KiB)              ctrl_q TX headers  (4096 * 64B)
++//   [256 KiB .. 512 KiB)        data_q TX headers  (4096 * 64B)
++//   [512 KiB .. 1536 KiB)       data_q RX headers  (4096 * 256B)
++//   [2 MiB .. 38 MiB)           ctrl_q RX buffers  (4096 * 9216B)
++const port_pool_bytes: usize = 40 << 20;
++const ctrl_tx_off: usize = 0;
++const data_tx_off: usize = 256 << 10;
++const data_rx_off: usize = 512 << 10;
++const ctrl_rx_off: usize = 2 << 20;
++
++const Op = enum(u8) {
++    probe = 0x01,
++    probe_ack = 0x02,
++    eager = 0x10,
++    rts = 0x11,
++    cts = 0x12,
++    bulk_data = 0x13,
++    ack = 0x14,
++    nack = 0x15,
++    ack_req = 0x16,
++    eager_req = 0x17,
++};
++
++const WireHdr = extern struct {
++    dst_mac: [6]u8 = @splat(0), // 0..5
++    src_mac: [6]u8 = @splat(0), // 6..11
++    ethertype_be: u16 = 0, // 12..13
++    opcode: u8 = 0, // 14
++    flags: u8 = 0, // 15
++    win_pkts: u16 = 0, // 16..17
++    total_pkts: u16 = 0, // 18..19
++    seq: u32 = 0, // 20..23
++    psn: u32 = 0, // 24..27
++    payload_len: u32 = 0, // 28..31
++    nbytes: u32 = 0, // 32..35
++    win_start: u32 = 0, // 36..39
++    cts_gen: u32 = 0, // 40..43
++    pad: [16]u8 = @splat(0), // 44..59
++    magic: u32 = wire_magic, // 60..63
++};
++
++comptime {
++    std.debug.assert(@sizeOf(WireHdr) == hdr_bytes);
++}
++
++pub const Error = error{
++    UnsupportedPlatform,
++    VmmUnavailable,
++    DeviceUnavailable,
++    NoPorts,
++    IoctlFailed,
++    MmapFailed,
++    MrFailed,
++    ProbeFailed,
++    PeerRefused,
++    ProxyFailed,
++    BadLayout,
++};
++
++/// Single-region geometry for dsv41/rdma.Ring (world = 2): send[slots][slot_bytes], recv[slots][2][slot_bytes],
++/// meta(flags[slots][2], doorbell, sizes[slots], sent[slots], abort_word). Each section is page-aligned so it maps
++/// straight into Ring.send / Ring.recv / Ring.meta.
++pub const Layout = struct {
++    slots: u32,
++    slot_bytes: usize,
++    send_off: usize,
++    send_len: usize,
++    recv_off: usize,
++    recv_len: usize,
++    meta_off: usize,
++    meta_len: usize,
++    total: usize,
++
++    pub const section_align: usize = @max(@as(usize, 4096), std.heap.page_size_min);
++
++    pub fn of(slots: u32, max_bytes: usize) Error!Layout {
++        if (slots < 2 or slots > max_slots or !std.math.isPowerOfTwo(slots)) return error.BadLayout;
++        const sb = std.mem.alignForward(usize, @max(max_bytes, 4096), 4096);
++        const send_len = std.mem.alignForward(usize, @as(usize, slots) * sb, section_align);
++        const recv_off = send_len;
++        const recv_len = std.mem.alignForward(usize, @as(usize, slots) * 2 * sb, section_align);
++        const meta_off = recv_off + recv_len;
++        const meta_words = @as(usize, slots) * 2 + 1 + 2 * @as(usize, slots) + 1;
++        const meta_len = std.mem.alignForward(usize, meta_words * 8, section_align);
++        return .{
++            .slots = slots,
++            .slot_bytes = sb,
++            .send_off = 0,
++            .send_len = send_len,
++            .recv_off = recv_off,
++            .recv_len = recv_len,
++            .meta_off = meta_off,
++            .meta_len = meta_len,
++            .total = meta_off + meta_len,
++        };
++    }
++
++    pub fn sendAt(l: Layout, slot: usize) usize {
++        return l.send_off + slot * l.slot_bytes;
++    }
++
++    pub fn recvAt(l: Layout, slot: usize, from_rank: usize) usize {
++        return l.recv_off + (slot * 2 + from_rank) * l.slot_bytes;
++    }
++};
++
++/// Peer rendezvous record exchanged over NCCL (or TCP in rdma_bench_main).
++pub const Info = extern struct {
++    ok: u32 = 0,
++    n_ports: u32 = 0,
++    slot_bytes: u64 = 0,
++    max_bytes: u64 = 0,
++    port_ids: [max_ports]u32 = @splat(0),
++    macs: [max_ports][6]u8 = @splat(@splat(0)),
++};
++
++/// TF_MGBE_ZC: 0/off disables; 1/on/unset attempts on TP=2 Linux when /dev/mgbe_zc exists.
++pub fn wanted(world: u32) bool {
++    if (comptime builtin.os.tag != .linux) return false;
++    if (world != 2) return false;
++    const v = std.c.getenv("TF_MGBE_ZC") orelse return true;
++    const s = std.mem.span(v);
++    return !(std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "off"));
++}
++
++fn debugOn() bool {
++    const v = std.c.getenv("TF_MGBE_ZC_DEBUG") orelse return false;
++    const s = std.mem.span(v);
++    return s.len > 0 and !std.mem.eql(u8, s, "0");
++}
++
++fn envUsize(name: [:0]const u8, default: usize) usize {
++    const v = std.c.getenv(name) orelse return default;
++    return std.fmt.parseInt(usize, std.mem.span(v), 10) catch default;
++}
++
++/// TF_MGBE_ZC_MAX_KB in bytes (default 20 MiB per rank: fits a full 2048-row attention/MoE prefill chunk in one op).
++pub fn maxBytesFromEnv() usize {
++    const kb = envUsize("TF_MGBE_ZC_MAX_KB", 20480);
++    const clamped: usize = @min(kb, 65536);
++    return @max(@as(usize, 64 << 10), clamped << 10);
++}
++
++fn eagerMaxBytesFromEnv() usize {
++    const kb = envUsize("TF_MGBE_ZC_EAGER_KB", 32);
++    const clamped: usize = @min(kb, 128);
++    return clamped << 10; // up to 16 jumbo packets per rail (mask fits u32)
++}
++
++fn timeoutNsFromEnv() u64 {
++    const s = envUsize("TF_MGBE_ZC_TIMEOUT_S", 15);
++    return @as(u64, @max(s, 2)) * 1_000_000_000;
++}
++
++fn arrivalTimeoutNsFromEnv(xfer_ns: u64) u64 {
++    const s = envUsize("TF_MGBE_ZC_ARRIVAL_TIMEOUT_S", 90);
++    return @max(xfer_ns, @as(u64, @max(s, 2)) * 1_000_000_000);
++}
++
++inline fn nowNs() u64 {
++    var ts: std.c.timespec = undefined;
++    _ = std.c.clock_gettime(.MONOTONIC, &ts);
++    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
++}
++
++fn nap(ns: u64) void {
++    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
++    _ = std.c.nanosleep(&ts, null);
++}
++
++inline fn dmbOshst() void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        asm volatile ("dmb oshst" ::: .{ .memory = true });
++    }
++}
++
++inline fn dsbSy() void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        asm volatile ("dsb sy" ::: .{ .memory = true });
++    }
++}
++
++inline fn mmioWrite32(base: [*]volatile u8, off: usize, val: u32) void {
++    dmbOshst();
++    const p: *volatile u32 = @ptrCast(@alignCast(base + off));
++    p.* = val;
++}
++
++inline fn mmioRead32(base: [*]volatile u8, off: usize) u32 {
++    const p: *volatile u32 = @ptrCast(@alignCast(base + off));
++    return p.*;
++}
++
++inline fn cacheCleanRange(ptr: [*]const u8, len: usize) void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        if (len == 0) return;
++        var a: usize = @intFromPtr(ptr) & ~@as(usize, 63);
++        const end: usize = @intFromPtr(ptr) + len;
++        while (a < end) : (a += 64) {
++            asm volatile ("dc cvac, %[a]"
++                :
++                : [a] "r" (a),
++                : .{ .memory = true });
++        }
++        asm volatile ("dsb sy" ::: .{ .memory = true });
++    }
++}
++
++inline fn cacheInvalRange(ptr: [*]const u8, len: usize) void {
++    if (comptime builtin.cpu.arch == .aarch64) {
++        if (len == 0) return;
++        var a: usize = @intFromPtr(ptr) & ~@as(usize, 63);
++        const end: usize = @intFromPtr(ptr) + len;
++        while (a < end) : (a += 64) {
++            asm volatile ("dc civac, %[a]"
++                :
++                : [a] "r" (a),
++                : .{ .memory = true });
++        }
++        asm volatile ("dsb sy\n\tisb" ::: .{ .memory = true });
++    }
++}
++
++fn placeRailWorker(rail_idx: usize, cpu: i32) void {
++    if (comptime builtin.os.tag != .linux) return;
++    var name: [16]u8 = @splat(0);
++    _ = std.fmt.bufPrint(name[0..15], "tf-mgbe-zc-{d}", .{rail_idx}) catch {};
++    _ = prctl(pr_set_name, @intFromPtr(&name), 0, 0, 0);
++    if (cpu < 0 or cpu >= 1024) return;
++    var set: std.os.linux.cpu_set_t = @splat(0);
++    const bits = @bitSizeOf(usize);
++    const idx: usize = @intCast(@divTrunc(cpu, bits));
++    const bit: usize = @intCast(@mod(cpu, bits));
++    if (idx < set.len) {
++        set[idx] = @as(usize, 1) << @intCast(bit);
++        std.os.linux.sched_setaffinity(0, &set) catch {};
++    }
++}
++
++fn ioctlCall(fd: i32, req: u32, arg: usize) Error!void {
++    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
++    const rc = std.os.linux.ioctl(fd, req, arg);
++    if (@as(isize, @bitCast(rc)) < 0) return error.IoctlFailed;
++}
++
++fn mmapFile(fd: i32, len: usize, off: u64) Error![*]align(4096) u8 {
++    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
++    const rc = std.os.linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, fd, @intCast(off));
++    const addr: isize = @bitCast(rc);
++    if (addr < 0) return error.MmapFailed;
++    return @ptrFromInt(rc);
++}
++
++fn mmapAnon(len: usize) Error![*]align(4096) u8 {
++    if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
++    const rc = std.os.linux.mmap(null, len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true, .POPULATE = true }, -1, 0);
++    const addr: isize = @bitCast(rc);
++    if (addr < 0) return error.MmapFailed;
++    return @ptrFromInt(rc);
++}
++
++fn munmapPtr(ptr: [*]align(4096) u8, len: usize) void {
++    if (comptime builtin.os.tag != .linux) return;
++    _ = std.os.linux.munmap(ptr, len);
++}
++
++fn closeFd(fd: i32) void {
++    if (comptime builtin.os.tag != .linux) return;
++    _ = std.os.linux.close(fd);
++}
++
++fn ioctlIgnore(fd: i32, req: u32, arg: usize) void {
++    if (comptime builtin.os.tag != .linux) return;
++    _ = std.os.linux.ioctl(fd, req, arg);
++}
++
++/// CUDA VMM HOST_NUMA buffer: directly accessible by both GPU kernels and /dev/mgbe_zc FOLL_LONGTERM SMMU DMA.
++pub const HostNumaRegion = struct {
++    d: *const Driver,
++    vmm: abi.VmmApi,
++    handle: u64 = 0,
++    va: u64 = 0,
++    size: usize = 0,
++
++    pub fn alloc(d: *const Driver, req_bytes: usize) !HostNumaRegion {
++        const vmm = d.vmm orelse return error.VmmUnavailable;
++        var dev: abi.Device = 0;
++        try d.check(vmm.cuCtxGetDevice(&dev), "cuCtxGetDevice");
++        var prop: abi.MemAllocationProp = .{
++            .type = abi.cu_mem_allocation_type_pinned,
++            .location = .{ .type = abi.cu_mem_location_type_host_numa, .id = 0 },
++        };
++        var gran: usize = 0;
++        try d.check(vmm.cuMemGetAllocationGranularity(&gran, &prop, abi.cu_mem_alloc_granularity_minimum), "cuMemGetAllocationGranularity");
++        if (gran == 0) return error.VmmUnavailable;
++        const sz = std.mem.alignForward(usize, req_bytes, @max(gran, Layout.section_align));
++        var handle: u64 = 0;
++        try d.check(vmm.cuMemCreate(&handle, sz, &prop, 0), "cuMemCreate(HOST_NUMA)");
++        errdefer _ = vmm.cuMemRelease(handle);
++        var va: u64 = 0;
++        try d.check(vmm.cuMemAddressReserve(&va, sz, @max(gran, Layout.section_align), 0, 0), "cuMemAddressReserve");
++        errdefer _ = vmm.cuMemAddressFree(va, sz);
++        try d.check(vmm.cuMemMap(va, sz, 0, handle, 0), "cuMemMap");
++        errdefer _ = vmm.cuMemUnmap(va, sz);
++        var acc = [2]abi.MemAccessDesc{
++            .{ .location = .{ .type = abi.cu_mem_location_type_device, .id = dev }, .flags = abi.cu_mem_access_flags_prot_readwrite },
++            .{ .location = .{ .type = abi.cu_mem_location_type_host_numa, .id = 0 }, .flags = abi.cu_mem_access_flags_prot_readwrite },
++        };
++        try d.check(vmm.cuMemSetAccess(va, sz, &acc, 2), "cuMemSetAccess");
++        const bytes: [*]u8 = @ptrFromInt(va);
++        @memset(bytes[0..sz], 0);
++        return .{ .d = d, .vmm = vmm, .handle = handle, .va = va, .size = sz };
++    }
++
++    pub fn ptr(r: HostNumaRegion) [*]align(Layout.section_align) u8 {
++        return @ptrFromInt(r.va);
++    }
++
++    pub fn free(r: *HostNumaRegion) void {
++        if (r.va != 0) {
++            _ = r.vmm.cuMemUnmap(r.va, r.size);
++            _ = r.vmm.cuMemAddressFree(r.va, r.size);
++            _ = r.vmm.cuMemRelease(r.handle);
++        }
++        r.* = undefined;
++        r.va = 0;
++    }
++};
++
++const Queue = struct {
++    port: u32 = 0,
++    qidx: u32 = 0,
++    hw_chan: u32 = 0,
++    tx_ring_iova: u64 = 0,
++    rx_ring_iova: u64 = 0,
++    tx_ring: ?[*]align(4096) uapi.HwDesc = null,
++    rx_ring: ?[*]align(4096) uapi.HwDesc = null,
++    reg_page: ?[*]align(4096) u8 = null,
++    ch_reg: [*]volatile u8 = undefined,
++    tx_prod: u32 = 0,
++    tx_cons: u32 = 0,
++    rx_prod: u32 = 0,
++    rx_cons: u32 = 0,
++    tx_hdr_va: [*]u8 = undefined,
++    tx_hdr_iova: u64 = 0,
++    rx_buf_va: [*]u8 = undefined,
++    rx_buf_iova: u64 = 0,
++    rx_stride: usize = 0,
++    started: bool = false,
++    tx_desc_cnt: [uapi.ring_desc_cnt]u8 = @splat(0),
++
++    fn setup(q: *Queue, fd: i32, port: u32, qidx: u32, sph: bool, tx_va: [*]u8, tx_iova: u64, rx_va: [*]u8, rx_iova: u64, rx_stride: usize) Error!void {
++        q.* = .{
++            .port = port,
++            .qidx = qidx,
++            .tx_hdr_va = tx_va,
++            .tx_hdr_iova = tx_iova,
++            .rx_buf_va = rx_va,
++            .rx_buf_iova = rx_iova,
++            .rx_stride = rx_stride,
++        };
++        var qa: uapi.QueueAlloc = .{ .port = port, .qidx = qidx };
++        try ioctlCall(fd, uapi.ioc_queue_alloc, @intFromPtr(&qa));
++        q.hw_chan = qa.hw_chan;
++        q.tx_ring_iova = qa.tx_ring_iova;
++        q.rx_ring_iova = qa.rx_ring_iova;
++        q.tx_ring = @ptrCast(try mmapFile(fd, uapi.ring_bytes, qa.mmap_tx_off));
++        errdefer if (q.tx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.rx_ring = @ptrCast(try mmapFile(fd, uapi.ring_bytes, qa.mmap_rx_off));
++        errdefer if (q.rx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.reg_page = try mmapFile(fd, uapi.reg_map_bytes, qa.mmap_reg_off);
++        errdefer if (q.reg_page) |p| munmapPtr(p, uapi.reg_map_bytes);
++        q.ch_reg = @as([*]volatile u8, @ptrCast(q.reg_page.?)) + qa.ch_reg_off;
++
++        var init_tail: u32 = 0;
++        if (!sph) {
++            const rx = q.rx_ring.?;
++            for (0..uapi.ring_desc_cnt - 1) |i| {
++                const b = rx_iova + @as(u64, i) * rx_stride;
++                rx[i] = .{
++                    .d0 = @truncate(b),
++                    .d1 = @truncate(b >> 32),
++                    .d2 = 0,
++                    .d3 = uapi.desc_own,
++                };
++            }
++            rx[uapi.ring_desc_cnt - 1].d3 = 0;
++            q.rx_prod = uapi.ring_desc_cnt - 1;
++            q.rx_cons = 0;
++            init_tail = uapi.ring_desc_cnt - 1;
++        }
++        dsbSy();
++        var qs: uapi.QueueStart = .{
++            .port = port,
++            .qidx = qidx,
++            .rx_buf_size = 9216,
++            .sph_enable = if (sph) 1 else 0,
++            .sph_split_bytes = if (sph) hdr_bytes else 0,
++            .init_rx_tail_idx = init_tail,
++        };
++        try ioctlCall(fd, uapi.ioc_queue_start, @intFromPtr(&qs));
++        q.started = true;
++    }
++
++    fn teardown(q: *Queue, fd: i32) void {
++        if (q.started and fd >= 0) {
++            var qst: uapi.QueueStop = .{ .port = q.port, .qidx = q.qidx };
++            ioctlIgnore(fd, uapi.ioc_queue_stop, @intFromPtr(&qst));
++            q.started = false;
++        }
++        if (q.reg_page) |p| munmapPtr(p, uapi.reg_map_bytes);
++        if (q.rx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        if (q.tx_ring) |p| munmapPtr(@ptrCast(p), uapi.ring_bytes);
++        q.reg_page = null;
++        q.rx_ring = null;
++        q.tx_ring = null;
++    }
++
++    fn reclaimTx(q: *Queue) void {
++        const tx = q.tx_ring.?;
++        while (q.tx_cons != q.tx_prod) {
++            const c0 = q.tx_cons & uapi.ring_mask;
++            const cnt: u32 = q.tx_desc_cnt[c0];
++            const last = (q.tx_cons +% cnt -% 1) & uapi.ring_mask;
++            if ((@atomicLoad(u32, &tx[last].d3, .acquire) & uapi.desc_own) != 0) break;
++            q.tx_cons +%= cnt;
++        }
++    }
++
++    fn ringTx(q: *Queue) void {
++        const tail = q.tx_prod & uapi.ring_mask;
++        mmioWrite32(q.ch_reg, uapi.ch_tdtlp, @truncate(q.tx_ring_iova +% @as(u64, tail) * 16));
++    }
++
++    fn ringRx(q: *Queue) void {
++        const tail = q.rx_prod & uapi.ring_mask;
++        mmioWrite32(q.ch_reg, uapi.ch_rdtlp, @truncate(q.rx_ring_iova +% @as(u64, tail) * 16));
++    }
++
++    fn sendCtrlHdr(q: *Queue, local_mac: [6]u8, peer_mac: [6]u8, in: WireHdr) void {
++        while ((q.tx_prod -% q.tx_cons) >= (uapi.ring_desc_cnt - 8)) q.reclaimTx();
++        const idx = q.tx_prod & uapi.ring_mask;
++        const h: *WireHdr = @ptrCast(@alignCast(q.tx_hdr_va + @as(usize, idx) * hdr_bytes));
++        h.* = in;
++        h.dst_mac = peer_mac;
++        h.src_mac = local_mac;
++        h.ethertype_be = std.mem.nativeToBig(u16, uapi.ethtype_ctrl);
++        h.payload_len = 0;
++        h.magic = wire_magic;
++        cacheCleanRange(@ptrCast(h), hdr_bytes);
++
++        const hiova = q.tx_hdr_iova + @as(u64, idx) * hdr_bytes;
++        const tx = q.tx_ring.?;
++        q.tx_desc_cnt[idx] = 1;
++        tx[idx].d0 = @truncate(hiova);
++        tx[idx].d1 = @truncate(hiova >> 32);
++        tx[idx].d2 = hdr_bytes;
++        dsbSy();
++        @atomicStore(u32, &tx[idx].d3, uapi.desc_own | uapi.desc_fd | uapi.desc_ld | hdr_bytes, .release);
++        q.tx_prod +%= 1;
++        q.ringTx();
++    }
++
++    fn sendGather(q: *Queue, ethertype: u16, local_mac: [6]u8, peer_mac: [6]u8, in: WireHdr, pay_iova: u64, plen: u32, ring_db: bool) void {
++        if (plen == 0) {
++            q.sendCtrlHdr(local_mac, peer_mac, in);
++            return;
++        }
++        while ((q.tx_prod -% q.tx_cons) >= (uapi.ring_desc_cnt - 8)) q.reclaimTx();
++        const d0 = q.tx_prod & uapi.ring_mask;
++        const d1 = (q.tx_prod +% 1) & uapi.ring_mask;
++        const h: *WireHdr = @ptrCast(@alignCast(q.tx_hdr_va + @as(usize, d0) * hdr_bytes));
++        h.* = in;
++        h.dst_mac = peer_mac;
++        h.src_mac = local_mac;
++        h.ethertype_be = std.mem.nativeToBig(u16, ethertype);
++        h.payload_len = plen;
++        h.magic = wire_magic;
++        cacheCleanRange(@ptrCast(h), hdr_bytes);
++
++        const tx = q.tx_ring.?;
++        q.tx_desc_cnt[d0] = 2;
++        tx[d1].d0 = @truncate(pay_iova);
++        tx[d1].d1 = @truncate(pay_iova >> 32);
++        tx[d1].d2 = plen & uapi.tdes2_b1l_mask;
++        tx[d1].d3 = uapi.desc_own | uapi.desc_ld;
++        dmbOshst();
++
++        const hiova = q.tx_hdr_iova + @as(u64, d0) * hdr_bytes;
++        tx[d0].d0 = @truncate(hiova);
++        tx[d0].d1 = @truncate(hiova >> 32);
++        tx[d0].d2 = hdr_bytes;
++        dsbSy();
++        const fl: u32 = (@as(u32, hdr_bytes) + plen) & uapi.tdes3_fl_mask;
++        @atomicStore(u32, &tx[d0].d3, uapi.desc_own | uapi.desc_fd | fl, .release);
++        q.tx_prod +%= 2;
++        if (ring_db) q.ringTx();
++    }
++
++    const CtrlRx = struct { hdr: WireHdr, payload: []const u8, valid: bool };
++
++    fn peekCtrl(q: *Queue) ?CtrlRx {
++        const rx = q.rx_ring.?;
++        const idx = q.rx_cons & uapi.ring_mask;
++        const d3 = @atomicLoad(u32, &rx[idx].d3, .acquire);
++        if ((d3 & uapi.desc_own) != 0) return null;
++
++        const slot_va = q.rx_buf_va + @as(usize, idx) * q.rx_stride;
++        const wlen: usize = d3 & uapi.rdes3_pl_mask;
++        const inv_len = @min(q.rx_stride, @max(hdr_bytes, wlen));
++        cacheInvalRange(slot_va, inv_len);
++        const h: *const WireHdr = @ptrCast(@alignCast(slot_va));
++        const ok = (d3 & uapi.rdes3_es_mgbe) == 0 and (d3 & uapi.desc_ctxt) == 0 and
++            wlen >= hdr_bytes and h.magic == wire_magic and wlen >= hdr_bytes + h.payload_len;
++        const plen: usize = if (ok) h.payload_len else 0;
++        return .{ .hdr = if (ok) h.* else .{}, .payload = (slot_va + hdr_bytes)[0..plen], .valid = ok };
++    }
++
++    fn consumeCtrl(q: *Queue) void {
++        const rx = q.rx_ring.?;
++        const idx = q.rx_cons & uapi.ring_mask;
++        rx[idx].d3 = 0;
++
++        const refill = q.rx_prod & uapi.ring_mask;
++        cacheInvalRange(q.rx_buf_va + @as(usize, refill) * q.rx_stride, hdr_bytes);
++        const b = q.rx_buf_iova + @as(u64, refill) * q.rx_stride;
++        rx[refill].d0 = @truncate(b);
++        rx[refill].d1 = @truncate(b >> 32);
++        rx[refill].d2 = 0;
++        dsbSy();
++        @atomicStore(u32, &rx[refill].d3, uapi.desc_own, .release);
++
++        q.rx_cons +%= 1;
++        q.rx_prod +%= 1;
++        q.ringRx();
++    }
++
++    fn postDdpRx(q: *Queue, dst_iova: u64, npkts: u32) void {
++        const rx = q.rx_ring.?;
++        for (0..npkts) |k| {
++            const idx = q.rx_prod & uapi.ring_mask;
++            cacheInvalRange(q.rx_buf_va + @as(usize, idx) * q.rx_stride, hdr_bytes + 64);
++            const hiova = q.rx_buf_iova + @as(u64, idx) * q.rx_stride;
++            const piova = dst_iova + @as(u64, k) * max_payload;
++            rx[idx].d0 = @truncate(hiova);
++            rx[idx].d1 = @truncate(hiova >> 32);
++            rx[idx].d2 = @truncate(piova);
++            dmbOshst();
++            @atomicStore(u32, &rx[idx].d3, (@as(u32, @truncate(piova >> 32)) & 0xFFFF) | uapi.desc_own, .release);
++            q.rx_prod +%= 1;
++        }
++        const tail = q.rx_prod & uapi.ring_mask;
++        rx[tail].d3 = 0;
++        q.ringRx();
++    }
++
++    fn postDdpDrain(q: *Queue, scratch_iova: u64, npkts: u32) void {
++        const rx = q.rx_ring.?;
++        for (0..npkts) |_| {
++            const idx = q.rx_prod & uapi.ring_mask;
++            cacheInvalRange(q.rx_buf_va + @as(usize, idx) * q.rx_stride, hdr_bytes + 64);
++            const hiova = q.rx_buf_iova + @as(u64, idx) * q.rx_stride;
++            rx[idx].d0 = @truncate(hiova);
++            rx[idx].d1 = @truncate(hiova >> 32);
++            rx[idx].d2 = @truncate(scratch_iova);
++            dmbOshst();
++            @atomicStore(u32, &rx[idx].d3, (@as(u32, @truncate(scratch_iova >> 32)) & 0xFFFF) | uapi.desc_own, .release);
++            q.rx_prod +%= 1;
++        }
++        const tail = q.rx_prod & uapi.ring_mask;
++        rx[tail].d3 = 0;
++        q.ringRx();
++    }
++
++    const DataComp = struct { hdr: WireHdr, plen: u32, err: bool };
++
++    fn dumpState(q: *const Queue, tag: []const u8) void {
++        const cur_rx = mmioRead32(q.ch_reg, 0x4C);
++        const rdtlp = mmioRead32(q.ch_reg, uapi.ch_rdtlp);
++        const cur_tx = mmioRead32(q.ch_reg, 0x44);
++        const tdtlp = mmioRead32(q.ch_reg, uapi.ch_tdtlp);
++        const status = mmioRead32(q.ch_reg, 0x60);
++        const rx_base_lo: u32 = @truncate(q.rx_ring_iova);
++        const tx_base_lo: u32 = @truncate(q.tx_ring_iova);
++        const hw_rx_idx = (cur_rx -% rx_base_lo) / 16;
++        const hw_rx_tail = (rdtlp -% rx_base_lo) / 16;
++        const hw_tx_idx = (cur_tx -% tx_base_lo) / 16;
++        const hw_tx_tail = (tdtlp -% tx_base_lo) / 16;
++        const rx = q.rx_ring.?;
++        const c = q.rx_cons & uapi.ring_mask;
++        const p = q.rx_prod & uapi.ring_mask;
++        var own0: u32 = 0;
++        var first_own0: i32 = -1;
++        var last_own0: i32 = -1;
++        for (0..uapi.ring_desc_cnt) |i| {
++            if ((@atomicLoad(u32, &rx[i].d3, .acquire) & uapi.desc_own) == 0) {
++                own0 += 1;
++                if (first_own0 < 0) first_own0 = @intCast(i);
++                last_own0 = @intCast(i);
++            }
++        }
++        std.log.err(
++            "mgbe_zc dump [{s} port={d} q={d} ch={d}] status=0x{x} RX(cons={d}({d}) prod={d}({d}) hw_cur={d} hw_tail={d} own0={d} [{d}..{d}]) TX(cons={d} prod={d} hw_cur={d} hw_tail={d}) d3[c-1..c+2]=[0x{x},0x{x},0x{x},0x{x}]",
++            .{
++                tag,      q.port,    q.qidx,    q.hw_chan,   status,
++                q.rx_cons, c,        q.rx_prod, p,           hw_rx_idx,
++                hw_rx_tail, own0,    first_own0, last_own0,  q.tx_cons,
++                q.tx_prod, hw_tx_idx, hw_tx_tail,
++                rx[(c -% 1) & uapi.ring_mask].d3,
++                rx[c].d3,
++                rx[(c +% 1) & uapi.ring_mask].d3,
++                rx[(c +% 2) & uapi.ring_mask].d3,
++            },
++        );
++    }
++
++    fn pollDataRx(q: *Queue) ?DataComp {
++        const rx = q.rx_ring.?;
++        while (q.rx_cons != q.rx_prod) {
++            const idx = q.rx_cons & uapi.ring_mask;
++            const d3 = @atomicLoad(u32, &rx[idx].d3, .acquire);
++            if ((d3 & uapi.desc_own) != 0) return null;
++            q.rx_cons +%= 1;
++            if ((d3 & uapi.desc_ctxt) != 0) continue;
++            const hva = q.rx_buf_va + @as(usize, idx) * q.rx_stride;
++            cacheInvalRange(hva, hdr_bytes);
++            const h: *const WireHdr = @ptrCast(@alignCast(hva));
++            const wpl: u32 = d3 & uapi.rdes3_pl_mask;
++            const plen: u32 = if (wpl >= @as(u32, hdr_bytes)) wpl - @as(u32, hdr_bytes) else 0;
++            const bad = (d3 & uapi.rdes3_es_mgbe) != 0 or h.magic != wire_magic;
++            return .{ .hdr = h.*, .plen = plen, .err = bad };
++        }
++        return null;
++    }
++};
++
++const EagerSlot = struct {
++    seq: u32 = 0,
++    mask: u32 = 0,
++    total_pkts: u16 = 0,
++    nbytes: u32 = 0,
++
++    fn done(e: EagerSlot) bool {
++        if (e.total_pkts == 0) return e.mask == 1;
++        if (e.total_pkts > 31) return false;
++        const want = (@as(u32, 1) << @intCast(e.total_pkts)) - 1;
++        return e.mask == want;
++    }
++};
++
++const EagerTxHist = struct {
++    seq: u32 = 0,
++    nbytes: u32 = 0,
++    off: usize = 0,
++    len: usize = 0,
++};
++
++const StashedRts = struct {
++    valid: bool = false,
++    seq: u32 = 0,
++    nbytes: u32 = 0,
++};
++
++const StashedCts = struct {
++    valid: bool = false,
++    seq: u32 = 0,
++    win_start: u32 = 0,
++    win_pkts: u16 = 0,
++    cts_gen: u32 = 0,
++};
++
++const Rail = struct {
++    rail_idx: usize = 0,
++    port: u32 = 0,
++    local_mac: [6]u8 = @splat(0),
++    peer_mac: [6]u8 = @splat(0),
++    ifname: [16]u8 = @splat(0),
++    pool_va: ?[*]align(4096) u8 = null,
++    pool_mr_id: u32 = 0,
++    pool_iova: u64 = 0,
++    region_iova: u64 = 0,
++    ctrl_q: Queue = .{},
++    data_q: Queue = .{},
++    last_seq: u64 = 0,
++    last_seq32: u32 = 0,
++    pin_cpu: i32 = -1,
++    eager_rx: [max_slots]EagerSlot = @splat(.{}),
++    eager_tx_hist: [max_slots]EagerTxHist = @splat(.{}),
++    stashed_rts: StashedRts = .{},
++    stashed_cts: StashedCts = .{},
++    stashed_ack_seq: u32 = 0,
++    stashed_ack_win: u32 = 0,
++    has_stashed_ack: bool = false,
++    stashed_nack_seq: u32 = 0,
++    stashed_nack_win: u32 = 0,
++    stashed_nack_flush: u16 = 0,
++    stashed_nack_gen: u32 = 0,
++    has_stashed_nack: bool = false,
++    peer_max_seq: u32 = 0,
++    in_ddp_rx: bool = false,
++    ddp_seq: u32 = 0,
++    ddp_rx_win_start: u32 = 0,
++    ddp_rx_acked: bool = false,
++    thread: ?std.Thread = null,
++    eager_cnt: u64 = 0,
++    ddp_cnt: u64 = 0,
++    retrans_cnt: u64 = 0,
++};
++
++pub fn stripeFor(nbytes: usize, rail: usize, n_ports: usize) struct { off: usize, len: usize } {
++    const packs = nbytes / 16;
++    const base = packs / n_ports;
++    const rem = packs % n_ports;
++    const before = rail * base + @min(rail, rem);
++    const mine = base + @as(usize, if (rail < rem) 1 else 0);
++    return .{ .off = before * 16, .len = mine * 16 };
++}
++
++fn parseCsvU32(text: []const u8, out: []u32) usize {
++    var n: usize = 0;
++    var it = std.mem.tokenizeScalar(u8, text, ',');
++    while (it.next()) |tok| {
++        if (n >= out.len) break;
++        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
++        if (trimmed.len == 0) continue;
++        out[n] = std.fmt.parseInt(u32, trimmed, 10) catch continue;
++        n += 1;
++    }
++    return n;
++}
++
++fn parseCsvI32(text: []const u8, out: []i32) usize {
++    var n: usize = 0;
++    var it = std.mem.tokenizeScalar(u8, text, ',');
++    while (it.next()) |tok| {
++        if (n >= out.len) break;
++        const trimmed = std.mem.trim(u8, tok, " \t\r\n");
++        if (trimmed.len == 0) continue;
++        out[n] = std.fmt.parseInt(i32, trimmed, 10) catch continue;
++        n += 1;
++    }
++    return n;
++}
++
++pub const FailCallback = struct {
++    ctx: *anyopaque,
++    fail: *const fn (ctx: *anyopaque, why: []const u8) void,
++};
++
++pub const State = struct {
++    gpa: std.mem.Allocator,
++    d: *const Driver,
++    rank: u32,
++    slots: u32,
++    slot_mask: u32,
++    fd: i32 = -1,
++    n_ports: u32 = 0,
++    rails: [max_ports]Rail = @splat(.{}),
++    layout: Layout,
++    region: HostNumaRegion,
++    region_mr_id: u32 = 0,
++    max_bytes: usize,
++    eager_max: usize,
++    timeout_ns: u64,
++    arrival_timeout_ns: u64,
++    idle_ns: u64,
++    nap_ns: u64,
++    debug: bool,
++    running: std.atomic.Value(bool) = .init(false),
++    arrived: [max_slots]std.atomic.Value(u32) = @splat(.init(0)),
++    fail_cb: ?FailCallback = null,
++    err: [256]u8 = @splat(0),
++
++    pub fn create(gpa: std.mem.Allocator, d: *const Driver, rank: u32, slots: u32, max_bytes: usize, idle_ns: u64, nap_ns: u64) !*State {
++        if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
++        if (rank >= 2) return error.BadLayout;
++        const layout = try Layout.of(slots, max_bytes);
++        const s = try gpa.create(State);
++        errdefer gpa.destroy(s);
++        const xfer_ns = timeoutNsFromEnv();
++        s.* = .{
++            .gpa = gpa,
++            .d = d,
++            .rank = rank,
++            .slots = slots,
++            .slot_mask = slots - 1,
++            .layout = layout,
++            .region = undefined,
++            .max_bytes = layout.slot_bytes,
++            .eager_max = eagerMaxBytesFromEnv(),
++            .timeout_ns = xfer_ns,
++            .arrival_timeout_ns = arrivalTimeoutNsFromEnv(xfer_ns),
++            .idle_ns = idle_ns,
++            .nap_ns = nap_ns,
++            .debug = debugOn(),
++        };
++        const fd_rc = std.os.linux.open(uapi.dev_path.ptr, .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
++        const fd_signed: isize = @bitCast(fd_rc);
++        if (fd_signed < 0) {
++            s.noteErr("open {s} failed (errno {d})", .{ uapi.dev_path, -fd_signed });
++            return error.DeviceUnavailable;
++        }
++        s.fd = @intCast(fd_signed);
++        errdefer {
++            closeFd(s.fd);
++            s.fd = -1;
++        }
++
++        // Discover requested or all present+up+MTU>=8256+SPH ports.
++        var want_ports: [max_ports]u32 = .{ 0, 1, 2, 3 };
++        var n_want: usize = max_ports;
++        if (std.c.getenv("TF_MGBE_ZC_PORTS")) |v| {
++            const parsed = parseCsvU32(std.mem.span(v), &want_ports);
++            if (parsed > 0) n_want = parsed;
++        }
++        var cpus: [max_ports]i32 = @splat(-1);
++        if (std.c.getenv("TF_MGBE_ZC_CPUS")) |v| {
++            _ = parseCsvI32(std.mem.span(v), &cpus);
++        }
++
++        var count: u32 = 0;
++        for (want_ports[0..n_want]) |p| {
++            if (p >= max_ports) continue;
++            var pi: uapi.PortInfo = .{ .port = p };
++            ioctlCall(s.fd, uapi.ioc_port_info, @intFromPtr(&pi)) catch continue;
++            if (pi.present == 0 or pi.link_up == 0 or pi.sph_supported == 0 or pi.mtu < 8256) continue;
++            s.rails[count] = .{
++                .rail_idx = count,
++                .port = p,
++                .local_mac = pi.mac,
++                .ifname = pi.ifname,
++                .pin_cpu = cpus[count],
++            };
++            count += 1;
++        }
++        if (count == 0) {
++            s.noteErr("no up MGBE port with MTU>=8256 and SPH=1", .{});
++            return error.NoPorts;
++        }
++        s.n_ports = count;
++
++        // Allocate single GPU+NIC shared HOST_NUMA region (send + recv + meta) and register MR across all ports.
++        s.region = HostNumaRegion.alloc(d, s.layout.total) catch |e| {
++            s.noteErr("CUDA HOST_NUMA alloc ({d} B) failed: {s}", .{ s.layout.total, @errorName(e) });
++            return e;
++        };
++        errdefer s.region.free();
++
++        var rmr: uapi.MrReq = .{ .va = s.region.va, .len = s.region.size, .dmabuf_fd = -1 };
++        ioctlCall(s.fd, uapi.ioc_reg_mr, @intFromPtr(&rmr)) catch {
++            s.noteErr("REG_MR region ({d} B) failed", .{s.region.size});
++            return error.MrFailed;
++        };
++        s.region_mr_id = rmr.mr_id;
++        errdefer ioctlIgnore(s.fd, uapi.ioc_dereg_mr, @intFromPtr(&s.region_mr_id));
++
++        errdefer s.teardownRails();
++        for (0..s.n_ports) |r| {
++            const rl = &s.rails[r];
++            rl.region_iova = rmr.iova[rl.port];
++            rl.pool_va = try mmapAnon(port_pool_bytes);
++            @memset(rl.pool_va.?[0..port_pool_bytes], 0);
++            cacheInvalRange(rl.pool_va.?, port_pool_bytes);
++            var pmr: uapi.MrReq = .{ .va = @intFromPtr(rl.pool_va.?), .len = port_pool_bytes, .dmabuf_fd = -1 };
++            ioctlCall(s.fd, uapi.ioc_reg_mr, @intFromPtr(&pmr)) catch {
++                s.noteErr("REG_MR port {d} header pool failed", .{rl.port});
++                return error.MrFailed;
++            };
++            rl.pool_mr_id = pmr.mr_id;
++            rl.pool_iova = pmr.iova[rl.port];
++            try rl.ctrl_q.setup(
++                s.fd,
++                rl.port,
++                0,
++                false,
++                rl.pool_va.? + ctrl_tx_off,
++                rl.pool_iova + ctrl_tx_off,
++                rl.pool_va.? + ctrl_rx_off,
++                rl.pool_iova + ctrl_rx_off,
++                ctrl_rx_stride,
++            );
++            try rl.data_q.setup(
++                s.fd,
++                rl.port,
++                1,
++                true,
++                rl.pool_va.? + data_tx_off,
++                rl.pool_iova + data_tx_off,
++                rl.pool_va.? + data_rx_off,
++                rl.pool_iova + data_rx_off,
++                data_rx_stride,
++            );
++        }
++        return s;
++    }
++
++    pub fn info(s: *const State) Info {
++        var b: Info = .{};
++        b.ok = 1;
++        b.n_ports = s.n_ports;
++        b.slot_bytes = s.layout.slot_bytes;
++        b.max_bytes = s.max_bytes;
++        for (0..s.n_ports) |r| {
++            b.port_ids[r] = s.rails[r].port;
++            b.macs[r] = s.rails[r].local_mac;
++        }
++        return b;
++    }
++
++    pub fn connect(s: *State, peer: Info) Error!void {
++        if (peer.ok == 0 or peer.n_ports != s.n_ports or peer.slot_bytes != s.layout.slot_bytes) {
++            s.noteErr("peer mismatch (ok={d} ports={d}/{d} slot={d}/{d})", .{ peer.ok, peer.n_ports, s.n_ports, peer.slot_bytes, s.layout.slot_bytes });
++            return error.PeerRefused;
++        }
++        s.max_bytes = @intCast(@min(s.max_bytes, peer.max_bytes));
++        for (0..s.n_ports) |r| s.rails[r].peer_mac = peer.macs[r];
++    }
++
++    pub fn sendSlice(s: *const State) []align(Layout.section_align) u8 {
++        return @alignCast(s.region.ptr()[s.layout.send_off..][0..s.layout.send_len]);
++    }
++    pub fn sendDev(s: *const State) abi.DevicePtr {
++        return s.region.va + s.layout.send_off;
++    }
++    pub fn recvSlice(s: *const State) []align(Layout.section_align) u8 {
++        return @alignCast(s.region.ptr()[s.layout.recv_off..][0..s.layout.recv_len]);
++    }
++    pub fn recvDev(s: *const State) abi.DevicePtr {
++        return s.region.va + s.layout.recv_off;
++    }
++    pub fn metaSlice(s: *const State) []align(Layout.section_align) u8 {
++        return @alignCast(s.region.ptr()[s.layout.meta_off..][0..s.layout.meta_len]);
++    }
++    pub fn metaDev(s: *const State) abi.DevicePtr {
++        return s.region.va + s.layout.meta_off;
++    }
++
++    // Ring metadata views inside the HOST_NUMA region (exact same layout as dsv41/rdma.zig).
++    fn flags(s: *const State) [*]u64 {
++        return @ptrCast(@alignCast(s.region.ptr() + s.layout.meta_off));
++    }
++    fn doorbell(s: *const State) *u64 {
++        return &s.flags()[@as(usize, s.slots) * 2];
++    }
++    fn sizes(s: *const State) [*]u64 {
++        return s.flags() + @as(usize, s.slots) * 2 + 1;
++    }
++    fn sent(s: *const State) [*]u64 {
++        return s.sizes() + s.slots;
++    }
++    fn abortWord(s: *const State) *u64 {
++        return &s.sent()[s.slots];
++    }
++    fn flagAt(s: *const State, q: u64, peer: usize) *u64 {
++        const slot: usize = @intCast(q & s.slot_mask);
++        return &s.flags()[slot * 2 + peer];
++    }
++    fn aborted(s: *const State) bool {
++        return @atomicLoad(u64, s.abortWord(), .acquire) != 0;
++    }
++
++    fn sendSlotPtr(s: *const State, slot: usize) [*]u8 {
++        return s.region.ptr() + s.layout.sendAt(slot);
++    }
++    fn recvSlotPtr(s: *const State, slot: usize, from_rank: usize) [*]u8 {
++        return s.region.ptr() + s.layout.recvAt(slot, from_rank);
++    }
++
++    fn noteErr(s: *State, comptime fmt: []const u8, args: anytype) void {
++        _ = std.fmt.bufPrint(s.err[0 .. s.err.len - 1], fmt, args) catch {};
++    }
++
++    pub fn lastErr(s: *const State) []const u8 {
++        return std.mem.sliceTo(&s.err, 0);
++    }
++
++    fn reportFailure(s: *State) void {
++        const msg = s.lastErr();
++        if (s.fail_cb) |cb| cb.fail(cb.ctx, if (msg.len > 0) msg else "mgbe_zc proxy failed");
++        @atomicStore(u64, s.abortWord(), 1, .release);
++    }
++
++    /// Bidirectional L2 ctrl + 64 KiB SPH=1 DDP probe on every rail before arming workers.
++    pub fn probeAll(s: *State) Error!void {
++        for (0..s.n_ports) |r| try s.probeRail(&s.rails[r]);
++        @memset(s.region.ptr()[0..s.layout.total], 0);
++        cacheCleanRange(s.region.ptr(), s.layout.total);
++    }
++
++    fn probeRail(s: *State, rl: *Rail) Error!void {
++        const deadline = nowNs() + 5_000_000_000;
++        // 1. Ctrl L2 ping-pong verifying peer MAC pairing.
++        var got_peer_probe = false;
++        var got_ack = false;
++        var last_tx: u64 = 0;
++        while (!(got_peer_probe and got_ack)) {
++            const t = nowNs();
++            if (t >= deadline) {
++                s.noteErr("port {d} ({s}) ctrl probe timed out", .{ rl.port, std.mem.sliceTo(&rl.ifname, 0) });
++                return error.ProbeFailed;
++            }
++            if (!got_ack and (t - last_tx) >= 2_000_000) {
++                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe), .seq = 0x50520000 | rl.port });
++                last_tx = t;
++            }
++            if (rl.ctrl_q.peekCtrl()) |rx| {
++                const h = rx.hdr;
++                const ok = rx.valid;
++                rl.ctrl_q.consumeCtrl();
++                if (!ok) continue;
++                if (h.opcode == @intFromEnum(Op.probe)) {
++                    got_peer_probe = true;
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe_ack), .seq = h.seq });
++                } else if (h.opcode == @intFromEnum(Op.probe_ack)) {
++                    got_ack = true;
++                }
++            }
++        }
++        // 2. 64 KiB (8 packets) bidirectional SPH=1 DDP probe into HOST_NUMA recv[0][peer].
++        const peer: usize = 1 - s.rank;
++        const probe_pkts: u32 = 8;
++        const probe_bytes: usize = probe_pkts * max_payload;
++        const send_va = s.sendSlotPtr(0);
++        const recv_va = s.recvSlotPtr(0, peer);
++        const send_iova = rl.region_iova + s.layout.sendAt(0);
++        const recv_iova = rl.region_iova + s.layout.recvAt(0, peer);
++        const my_tag: u8 = if (s.rank == 0) 0xA5 else 0x5A;
++        const peer_tag: u8 = if (s.rank == 0) 0x5A else 0xA5;
++        for (0..probe_bytes) |i| send_va[i] = my_tag ^ @as(u8, @truncate((i *% 31) >> 3));
++        cacheCleanRange(send_va, probe_bytes);
++        @memset(recv_va[0..probe_bytes], 0xEE);
++        cacheInvalRange(recv_va, probe_bytes);
++
++        rl.data_q.postDdpRx(recv_iova, probe_pkts);
++        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.cts), .seq = 0, .win_start = 0, .win_pkts = probe_pkts, .cts_gen = 1 });
++
++        var peer_cts = false;
++        var tx_sent = false;
++        var peer_ack = false;
++        var rx_got: u32 = 0;
++        var last_cts_tx = nowNs();
++        while (!(rx_got == probe_pkts and peer_ack)) {
++            const t = nowNs();
++            if (t >= deadline) {
++                s.noteErr("port {d} DDP probe timed out (rx={d}/{d}, cts={}, ack={})", .{ rl.port, rx_got, probe_pkts, peer_cts, peer_ack });
++                return error.ProbeFailed;
++            }
++            if (!tx_sent and !peer_cts and (t - last_cts_tx) >= 2_000_000) {
++                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.cts), .seq = 0, .win_start = 0, .win_pkts = probe_pkts, .cts_gen = 1 });
++                last_cts_tx = t;
++            }
++            while (rl.ctrl_q.peekCtrl()) |rx| {
++                const h = rx.hdr;
++                const ok = rx.valid;
++                rl.ctrl_q.consumeCtrl();
++                if (!ok) continue;
++                if (h.opcode == @intFromEnum(Op.probe)) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.probe_ack), .seq = h.seq });
++                } else if (h.opcode == @intFromEnum(Op.cts) and h.seq == 0) {
++                    peer_cts = true;
++                } else if (h.opcode == @intFromEnum(Op.ack) and h.seq == 0) {
++                    peer_ack = true;
++                }
++            }
++            if (peer_cts and !tx_sent) {
++                for (0..probe_pkts) |k| {
++                    rl.data_q.sendGather(
++                        uapi.ethtype_data,
++                        rl.local_mac,
++                        rl.peer_mac,
++                        .{ .opcode = @intFromEnum(Op.bulk_data), .seq = 0, .psn = @intCast(k), .win_pkts = probe_pkts, .cts_gen = 1 },
++                        send_iova + @as(u64, k) * max_payload,
++                        max_payload,
++                        k + 1 == probe_pkts,
++                    );
++                }
++                tx_sent = true;
++            }
++            while (rl.data_q.pollDataRx()) |comp| {
++                if (comp.err or comp.hdr.opcode != @intFromEnum(Op.bulk_data) or comp.hdr.psn != rx_got or comp.plen != max_payload) {
++                    s.noteErr("port {d} DDP probe bad pkt (err={} psn={d} want={d} plen={d})", .{ rl.port, comp.err, comp.hdr.psn, rx_got, comp.plen });
++                    return error.ProbeFailed;
++                }
++                rx_got += 1;
++                if (rx_got == probe_pkts) {
++                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{ .opcode = @intFromEnum(Op.ack), .seq = 0, .win_start = 0, .win_pkts = probe_pkts });
++                }
++            }
++        }
++        cacheInvalRange(recv_va, probe_bytes);
++        for (0..probe_bytes) |i| {
++            const want = peer_tag ^ @as(u8, @truncate((i *% 31) >> 3));
++            if (recv_va[i] != want) {
++                s.noteErr("port {d} DDP probe payload mismatch at byte {d} (got 0x{x} want 0x{x})", .{ rl.port, i, recv_va[i], want });
++                return error.ProbeFailed;
++            }
++        }
++        if (s.debug) std.log.info("mgbe_zc rank {d} port {d} ({s}): ctrl+DDP probe OK", .{ s.rank, rl.port, std.mem.sliceTo(&rl.ifname, 0) });
++    }
++
++    pub fn start(s: *State, cb: FailCallback) std.Thread.SpawnError!void {
++        if (s.running.swap(true, .acq_rel)) return;
++        s.fail_cb = cb;
++        errdefer s.stop();
++        for (0..s.n_ports) |r| {
++            s.rails[r].thread = try std.Thread.spawn(.{}, railWorker, .{ s, r });
++        }
++    }
++
++    pub fn stop(s: *State) void {
++        if (s.running.swap(false, .acq_rel)) {
++            for (0..s.n_ports) |r| {
++                if (s.rails[r].thread) |t| t.join();
++                s.rails[r].thread = null;
++            }
++        }
++    }
++
++    fn teardownRails(s: *State) void {
++        for (0..s.n_ports) |r| {
++            const rl = &s.rails[r];
++            rl.data_q.teardown(s.fd);
++            rl.ctrl_q.teardown(s.fd);
++            if (rl.pool_mr_id != 0 and s.fd >= 0) {
++                ioctlIgnore(s.fd, uapi.ioc_dereg_mr, @intFromPtr(&rl.pool_mr_id));
++                rl.pool_mr_id = 0;
++            }
++            if (rl.pool_va) |p| {
++                munmapPtr(p, port_pool_bytes);
++                rl.pool_va = null;
++            }
++        }
++    }
++
++    pub fn destroy(s: *State) void {
++        s.stop();
++        if (s.debug and s.n_ports > 0 and (s.rails[0].eager_cnt > 0 or s.rails[0].ddp_cnt > 0)) {
++            std.log.info("mgbe_zc rank {d}: rail0 eager={d} ddp={d} retrans={d}", .{
++                s.rank, s.rails[0].eager_cnt, s.rails[0].ddp_cnt, s.rails[0].retrans_cnt,
++            });
++        }
++        s.teardownRails();
++        if (s.region_mr_id != 0 and s.fd >= 0) {
++            ioctlIgnore(s.fd, uapi.ioc_dereg_mr, @intFromPtr(&s.region_mr_id));
++            s.region_mr_id = 0;
++        }
++        s.region.free();
++        if (s.fd >= 0) {
++            closeFd(s.fd);
++            s.fd = -1;
++        }
++        s.gpa.destroy(s);
++    }
++
++    /// Poll ctrl_q for incoming control/eager packets, handling both current and lookahead frames.
++    /// Returns true if at least one frame was processed.
++    fn drainCtrlRx(s: *State, rl: *Rail) bool {
++        var any = false;
++        const peer: usize = 1 - s.rank;
++        while (rl.ctrl_q.peekCtrl()) |rx| {
++            any = true;
++            const h = rx.hdr;
++            const ok = rx.valid;
++            if (ok) {
++                const is_data_op = h.opcode == @intFromEnum(Op.eager) or
++                    h.opcode == @intFromEnum(Op.rts) or
++                    h.opcode == @intFromEnum(Op.cts) or
++                    h.opcode == @intFromEnum(Op.ack) or
++                    h.opcode == @intFromEnum(Op.nack) or
++                    h.opcode == @intFromEnum(Op.ack_req) or
++                    h.opcode == @intFromEnum(Op.eager_req);
++                const seq_ahead: i32 = @bitCast(h.seq -% rl.last_seq32);
++                if (is_data_op and h.seq != 0 and seq_ahead > 0 and seq_ahead <= @as(i32, @intCast(s.slots)) and
++                    @as(i32, @bitCast(h.seq -% rl.peer_max_seq)) > 0)
++                {
++                    rl.peer_max_seq = h.seq;
++                }
++                switch (h.opcode) {
++                    @intFromEnum(Op.eager) => {
++                        const slot: usize = @intCast(h.seq & s.slot_mask);
++                        if ((h.flags & flag_retrans) != 0 and h.seq != 0 and h.seq == rl.eager_tx_hist[slot].seq and
++                            @as(i32, @bitCast(h.seq -% rl.last_seq32)) <= 0)
++                        {
++                            // Peer missed our eager frame after we exited runExchange(h.seq); send[slot] is still
++                            // intact because the ping-pong slots cannot wrap until peer completes h.seq.
++                            const th = rl.eager_tx_hist[slot];
++                            s.sendEagerBurst(rl, th.seq, th.nbytes, th.off, th.len, false);
++                            rl.retrans_cnt += 1;
++                        }
++                        const es = &rl.eager_rx[slot];
++                        if (h.seq != es.seq) {
++                            if (h.seq != 0 and @as(i32, @bitCast(h.seq -% rl.last_seq32)) > 0) {
++                                es.* = .{ .seq = h.seq, .mask = 0, .total_pkts = h.total_pkts, .nbytes = h.nbytes };
++                            } else {
++                                rl.ctrl_q.consumeCtrl();
++                                continue;
++                            }
++                        }
++                        if (h.total_pkts > 0 and h.total_pkts <= 31 and h.psn < h.total_pkts) {
++                            const bit = @as(u32, 1) << @intCast(h.psn);
++                            if ((es.mask & bit) == 0) {
++                                const st = stripeFor(h.nbytes, rl.rail_idx, s.n_ports);
++                                const rel_off = st.off + @as(usize, h.psn) * max_payload;
++                                if (rel_off + rx.payload.len <= s.layout.slot_bytes) {
++                                    @memcpy((s.recvSlotPtr(slot, peer) + rel_off)[0..rx.payload.len], rx.payload);
++                                }
++                                es.mask |= bit;
++                            }
++                        } else if (h.total_pkts == 0) {
++                            es.mask = 1;
++                        }
++                    },
++                    @intFromEnum(Op.eager_req) => {
++                        const slot: usize = @intCast(h.seq & s.slot_mask);
++                        if (h.seq != 0 and h.seq == rl.eager_tx_hist[slot].seq) {
++                            const th = rl.eager_tx_hist[slot];
++                            s.sendEagerBurst(rl, th.seq, th.nbytes, th.off, th.len, false);
++                            rl.retrans_cnt += 1;
++                        }
++                    },
++                    @intFromEnum(Op.rts) => {
++                        if (!rl.stashed_rts.valid or @as(i32, @bitCast(h.seq -% rl.stashed_rts.seq)) >= 0) {
++                            rl.stashed_rts = .{ .valid = true, .seq = h.seq, .nbytes = h.nbytes };
++                        }
++                    },
++                    @intFromEnum(Op.cts) => {
++                        if (!rl.stashed_cts.valid or
++                            @as(i32, @bitCast(h.seq -% rl.stashed_cts.seq)) > 0 or
++                            (h.seq == rl.stashed_cts.seq and (h.win_start > rl.stashed_cts.win_start or
++                                (h.win_start == rl.stashed_cts.win_start and @as(i32, @bitCast(h.cts_gen -% rl.stashed_cts.cts_gen)) >= 0))))
++                        {
++                            rl.stashed_cts = .{ .valid = true, .seq = h.seq, .win_start = h.win_start, .win_pkts = h.win_pkts, .cts_gen = h.cts_gen };
++                        }
++                    },
++                    @intFromEnum(Op.ack) => {
++                        if (!rl.has_stashed_ack or
++                            @as(i32, @bitCast(h.seq -% rl.stashed_ack_seq)) > 0 or
++                            (h.seq == rl.stashed_ack_seq and h.win_start >= rl.stashed_ack_win))
++                        {
++                            rl.stashed_ack_seq = h.seq;
++                            rl.stashed_ack_win = h.win_start;
++                            rl.has_stashed_ack = true;
++                        }
++                    },
++                    @intFromEnum(Op.ack_req) => {
++                        if (h.seq != 0) {
++                            const already_acked = (@as(i32, @bitCast(h.seq -% rl.last_seq32)) <= 0) or
++                                (rl.in_ddp_rx and h.seq == rl.ddp_seq and (h.win_start < rl.ddp_rx_win_start or
++                                    (h.win_start == rl.ddp_rx_win_start and rl.ddp_rx_acked)));
++                            if (already_acked) {
++                                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                    .opcode = @intFromEnum(Op.ack),
++                                    .seq = h.seq,
++                                    .win_start = h.win_start,
++                                    .win_pkts = h.win_pkts,
++                                });
++                                rl.retrans_cnt += 1;
++                            }
++                        }
++                    },
++                    @intFromEnum(Op.nack) => {
++                        if (@as(i32, @bitCast(h.seq -% rl.last_seq32)) > 0) {
++                            rl.stashed_nack_seq = h.seq;
++                            rl.stashed_nack_win = h.win_start;
++                            rl.stashed_nack_flush = h.win_pkts;
++                            rl.stashed_nack_gen = h.cts_gen;
++                            rl.has_stashed_nack = true;
++                        }
++                    },
++                    else => {},
++                }
++            }
++            rl.ctrl_q.consumeCtrl();
++        }
++        return any;
++    }
++
++    fn sendEagerBurst(s: *State, rl: *Rail, seq32: u32, nbytes: u32, off: usize, len: usize, is_retrans: bool) void {
++        const slot: usize = @intCast(seq32 & s.slot_mask);
++        const send_iova = rl.region_iova + s.layout.sendAt(slot) + off;
++        const npkts: u16 = if (len == 0) 0 else @intCast((len + max_payload - 1) / max_payload);
++        if (npkts == 0) {
++            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                .opcode = @intFromEnum(Op.eager),
++                .flags = if (is_retrans) flag_retrans else 0,
++                .seq = seq32,
++                .nbytes = nbytes,
++                .total_pkts = 0,
++            });
++            return;
++        }
++        for (0..npkts) |k| {
++            const po = k * max_payload;
++            const plen: u32 = @intCast(@min(max_payload, len - po));
++            rl.ctrl_q.sendGather(
++                uapi.ethtype_ctrl,
++                rl.local_mac,
++                rl.peer_mac,
++                .{
++                    .opcode = @intFromEnum(Op.eager),
++                    .flags = if (is_retrans and k == 0) flag_retrans else 0,
++                    .seq = seq32,
++                    .psn = @intCast(k),
++                    .total_pkts = npkts,
++                    .nbytes = nbytes,
++                },
++                send_iova + po,
++                plen,
++                k + 1 == npkts,
++            );
++        }
++    }
++
++    fn runExchange(s: *State, rl: *Rail, q: u64, tx_nbytes: u32) Error!void {
++        const seq32: u32 = @truncate(q);
++        const slot: usize = @intCast(q & s.slot_mask);
++        const peer: usize = 1 - s.rank;
++        const tx_st = stripeFor(tx_nbytes, rl.rail_idx, s.n_ports);
++        const tx_is_eager = tx_st.len <= s.eager_max;
++
++        if (tx_st.len > 0) cacheCleanRange(s.sendSlotPtr(slot) + tx_st.off, tx_st.len);
++
++        if (tx_is_eager) {
++            rl.eager_tx_hist[slot] = .{ .seq = seq32, .nbytes = tx_nbytes, .off = tx_st.off, .len = tx_st.len };
++            s.sendEagerBurst(rl, seq32, tx_nbytes, tx_st.off, tx_st.len, false);
++            const t0 = nowNs();
++            var peer_seen = @as(i32, @bitCast(rl.peer_max_seq -% seq32)) >= 0;
++            var t_xfer = t0;
++            var last_tx = t0;
++            while (s.running.load(.monotonic) and !s.aborted()) {
++                _ = s.drainCtrlRx(rl);
++                const es = &rl.eager_rx[slot];
++                if (es.seq == seq32 and es.done()) {
++                    const rx_st = stripeFor(es.nbytes, rl.rail_idx, s.n_ports);
++                    if (rx_st.len > 0) cacheCleanRange(s.recvSlotPtr(slot, peer) + rx_st.off, rx_st.len);
++                    rl.eager_cnt += 1;
++                    return;
++                }
++                if (rl.stashed_rts.valid and rl.stashed_rts.seq == seq32) {
++                    // Asymmetric exchange: our TX was eager, peer's TX is bulk DDP.
++                    const rx_nbytes = rl.stashed_rts.nbytes;
++                    rl.stashed_rts.valid = false;
++                    return s.runBulk(rl, seq32, slot, tx_nbytes, tx_st.off, tx_st.len, true, rx_nbytes);
++                }
++                const t = nowNs();
++                if (!peer_seen and @as(i32, @bitCast(rl.peer_max_seq -% seq32)) >= 0) {
++                    peer_seen = true;
++                    t_xfer = t;
++                }
++                if (t - last_tx >= 500_000) {
++                    s.sendEagerBurst(rl, seq32, tx_nbytes, tx_st.off, tx_st.len, true);
++                    rl.retrans_cnt += 1;
++                    last_tx = t;
++                }
++                const timed_out = if (peer_seen) (t - t_xfer >= s.timeout_ns) else (t - t0 >= s.arrival_timeout_ns);
++                if (timed_out) {
++                    rl.ctrl_q.dumpState("ctrl_q");
++                    s.noteErr("port {d} eager seq {d} ({d} B) timed out (got_seq={d} mask=0x{x} pkts={d} peer_max_seq={d} peer_seen={})", .{
++                        rl.port, seq32, tx_st.len, es.seq, es.mask, es.total_pkts, rl.peer_max_seq, peer_seen,
++                    });
++                    return error.ProxyFailed;
++                }
++            }
++            return error.ProxyFailed;
++        }
++
++        // Our TX is bulk DDP: announce tx_nbytes via RTS and drive independent TX & RX state machines.
++        return s.runBulk(rl, seq32, slot, tx_nbytes, tx_st.off, tx_st.len, false, null);
++    }
++
++    const RxMode = enum { unknown, eager, ddp };
++
++    fn runBulk(
++        s: *State,
++        rl: *Rail,
++        seq32: u32,
++        slot: usize,
++        tx_nbytes: u32,
++        tx_off: usize,
++        tx_len: usize,
++        tx_already_eager: bool,
++        known_rx_nbytes: ?u32,
++    ) Error!void {
++        const peer: usize = 1 - s.rank;
++        const send_iova = rl.region_iova + s.layout.sendAt(slot) + tx_off;
++        const recv_slot_va = s.recvSlotPtr(slot, peer);
++        const recv_slot_iova = rl.region_iova + s.layout.recvAt(slot, peer);
++
++        // TX DDP state
++        var tx_done = tx_already_eager;
++        const tx_total_pkts: u32 = if (tx_done) 0 else @intCast((tx_len + max_payload - 1) / max_payload);
++        var tx_win_start: u32 = 0;
++        var tx_win_pkts: u32 = if (tx_done) 0 else @min(bulk_win_max_pkts, tx_total_pkts);
++        var tx_allowed = false;
++        var tx_sent: u32 = 0;
++        var tx_flush: u32 = 0;
++        var tx_acked = false;
++        var peer_cts_gen: u32 = 0;
++
++        // RX state
++        var rx_mode: RxMode = .unknown;
++        var rx_done = false;
++        var rx_off: usize = 0;
++        var rx_len: usize = 0;
++        var rx_total_pkts: u32 = 0;
++        var rx_win_start: u32 = 0;
++        var rx_win_pkts: u32 = 0;
++        var rx_got: u32 = 0;
++        var rx_skip: u32 = 0;
++        var rx_gap = false;
++        var rx_draining = false;
++        var rx_drain_since: u64 = 0;
++        var rx_cts_gen: u32 = 1;
++
++        rl.in_ddp_rx = false;
++        rl.ddp_seq = seq32;
++        rl.ddp_rx_win_start = 0;
++        rl.ddp_rx_acked = false;
++        defer {
++            rl.in_ddp_rx = false;
++            rl.ddp_rx_acked = false;
++        }
++
++        const t_start = nowNs();
++        var peer_seen = (known_rx_nbytes != null) or (@as(i32, @bitCast(rl.peer_max_seq -% seq32)) >= 0);
++        var t_xfer = t_start;
++        var last_rts_tx = t_start;
++        var last_ack_req_tx = t_start;
++        var last_eager_req_tx = t_start;
++        var last_cts_tx = t_start;
++        var last_rx_activity = t_start;
++
++        if (!tx_done) {
++            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                .opcode = @intFromEnum(Op.rts),
++                .seq = seq32,
++                .nbytes = tx_nbytes,
++            });
++        }
++
++        if (known_rx_nbytes) |rnb| {
++            if (rnb > s.layout.slot_bytes) {
++                s.noteErr("port {d} seq {d}: peer rx_nbytes {d} > slot {d}", .{ rl.port, seq32, rnb, s.layout.slot_bytes });
++                return error.ProxyFailed;
++            }
++            const rst = stripeFor(rnb, rl.rail_idx, s.n_ports);
++            rx_off = rst.off;
++            rx_len = rst.len;
++            rx_total_pkts = if (rx_len == 0) 0 else @intCast((rx_len + max_payload - 1) / max_payload);
++            if (rx_total_pkts == 0) {
++                rx_done = true;
++            } else {
++                rx_mode = .ddp;
++                cacheInvalRange(recv_slot_va + rx_off, rx_len);
++                rx_win_start = 0;
++                rx_win_pkts = @min(bulk_win_max_pkts, rx_total_pkts);
++                rx_cts_gen = 1;
++                rl.in_ddp_rx = true;
++                rl.ddp_rx_win_start = 0;
++                rl.ddp_rx_acked = false;
++                rl.data_q.postDdpRx(recv_slot_iova + rx_off, rx_win_pkts);
++                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                    .opcode = @intFromEnum(Op.cts),
++                    .seq = seq32,
++                    .win_start = 0,
++                    .win_pkts = @intCast(rx_win_pkts),
++                    .nbytes = rnb,
++                    .cts_gen = rx_cts_gen,
++                });
++                last_cts_tx = nowNs();
++                last_rx_activity = last_cts_tx;
++            }
++        }
++
++        while (!(tx_done and rx_done)) {
++            if (!s.running.load(.monotonic) or s.aborted()) return error.ProxyFailed;
++            _ = s.drainCtrlRx(rl);
++            const t_now = nowNs();
++
++            // 1. Progress RX side.
++            var drained_any = false;
++            if (!rx_done) {
++                switch (rx_mode) {
++                    .unknown => {
++                        if (rl.stashed_rts.valid and rl.stashed_rts.seq == seq32) {
++                            const rnb = rl.stashed_rts.nbytes;
++                            rl.stashed_rts.valid = false;
++                            if (rnb > s.layout.slot_bytes) {
++                                s.noteErr("port {d} seq {d}: peer rx_nbytes {d} > slot {d}", .{ rl.port, seq32, rnb, s.layout.slot_bytes });
++                                return error.ProxyFailed;
++                            }
++                            const rst = stripeFor(rnb, rl.rail_idx, s.n_ports);
++                            rx_off = rst.off;
++                            rx_len = rst.len;
++                            rx_total_pkts = if (rx_len == 0) 0 else @intCast((rx_len + max_payload - 1) / max_payload);
++                            if (rx_total_pkts == 0) {
++                                rx_done = true;
++                            } else {
++                                rx_mode = .ddp;
++                                cacheInvalRange(recv_slot_va + rx_off, rx_len);
++                                rx_win_start = 0;
++                                rx_win_pkts = @min(bulk_win_max_pkts, rx_total_pkts);
++                                rx_cts_gen = 1;
++                                rl.in_ddp_rx = true;
++                                rl.ddp_rx_win_start = 0;
++                                rl.ddp_rx_acked = false;
++                                rl.data_q.postDdpRx(recv_slot_iova + rx_off, rx_win_pkts);
++                                rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                    .opcode = @intFromEnum(Op.cts),
++                                    .seq = seq32,
++                                    .win_start = 0,
++                                    .win_pkts = @intCast(rx_win_pkts),
++                                    .nbytes = rnb,
++                                    .cts_gen = rx_cts_gen,
++                                });
++                                last_cts_tx = t_now;
++                                last_rx_activity = t_now;
++                            }
++                        } else if (rl.eager_rx[slot].seq == seq32) {
++                            rx_mode = .eager;
++                        } else if (t_now - last_eager_req_tx >= 500_000) {
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.eager_req),
++                                .seq = seq32,
++                            });
++                            last_eager_req_tx = t_now;
++                        }
++                    },
++                    .eager => {
++                        const es = &rl.eager_rx[slot];
++                        if (es.seq == seq32 and es.done()) {
++                            const rst = stripeFor(es.nbytes, rl.rail_idx, s.n_ports);
++                            if (rst.len > 0) cacheCleanRange(recv_slot_va + rst.off, rst.len);
++                            rx_done = true;
++                        } else if (t_now - last_eager_req_tx >= 500_000) {
++                            rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                .opcode = @intFromEnum(Op.eager_req),
++                                .seq = seq32,
++                            });
++                            last_eager_req_tx = t_now;
++                        }
++                    },
++                    .ddp => {
++                        const win_off = @as(u64, rx_win_start) * max_payload;
++                        const rx_win_iova = recv_slot_iova + rx_off + win_off;
++                        if (rx_draining) {
++                            while (rl.data_q.pollDataRx()) |_| {
++                                drained_any = true;
++                                rx_drain_since = nowNs();
++                                last_rx_activity = rx_drain_since;
++                            }
++                            const avail: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                            if (avail < 32 and avail + 64 + rx_win_pkts < uapi.ring_desc_cnt - 16) {
++                                rl.data_q.postDdpDrain(rx_win_iova, 64);
++                            }
++                            const t_d = nowNs();
++                            if ((t_d - rx_drain_since) >= 1_000_000) {
++                                const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                                if (rem + rx_win_pkts < uapi.ring_desc_cnt - 16) {
++                                    rx_draining = false;
++                                    rx_skip = rem;
++                                    rx_got = 0;
++                                    rx_gap = false;
++                                    rx_cts_gen +%= 1;
++                                    rl.retrans_cnt += 1;
++                                    rl.data_q.postDdpRx(rx_win_iova, rx_win_pkts);
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.nack),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rem),
++                                        .cts_gen = rx_cts_gen,
++                                    });
++                                    last_rx_activity = t_d;
++                                }
++                            }
++                        } else {
++                            while (rx_skip > 0 or rx_got < rx_win_pkts) {
++                                const comp = rl.data_q.pollDataRx() orelse break;
++                                drained_any = true;
++                                last_rx_activity = nowNs();
++                                if (rx_skip > 0) {
++                                    rx_skip -= 1;
++                                    continue;
++                                }
++                                if (comp.err or comp.hdr.seq != seq32 or comp.hdr.win_start != rx_win_start or comp.hdr.cts_gen != rx_cts_gen or comp.hdr.psn != rx_got) {
++                                    rx_gap = true;
++                                }
++                                rx_got += 1;
++                            }
++                            if (rx_skip == 0 and rx_got == rx_win_pkts) {
++                                if (!rx_gap) {
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.ack),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rx_win_pkts),
++                                    });
++                                    rl.ddp_rx_acked = true;
++                                    rx_win_start += rx_win_pkts;
++                                    if (rx_win_start >= rx_total_pkts) {
++                                        cacheInvalRange(recv_slot_va + rx_off, rx_len);
++                                        rx_done = true;
++                                    } else {
++                                        rx_win_pkts = @min(bulk_win_max_pkts, rx_total_pkts - rx_win_start);
++                                        rx_got = 0;
++                                        rx_skip = 0;
++                                        rx_gap = false;
++                                        rx_cts_gen +%= 1;
++                                        rl.ddp_rx_win_start = rx_win_start;
++                                        rl.ddp_rx_acked = false;
++                                        const next_off = @as(u64, rx_win_start) * max_payload;
++                                        rl.data_q.postDdpRx(recv_slot_iova + rx_off + next_off, rx_win_pkts);
++                                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                            .opcode = @intFromEnum(Op.cts),
++                                            .seq = seq32,
++                                            .win_start = rx_win_start,
++                                            .win_pkts = @intCast(rx_win_pkts),
++                                            .cts_gen = rx_cts_gen,
++                                        });
++                                        last_cts_tx = nowNs();
++                                        last_rx_activity = last_cts_tx;
++                                    }
++                                } else {
++                                    rx_draining = true;
++                                    rx_drain_since = nowNs();
++                                    rx_got = 0;
++                                    rx_gap = false;
++                                    if (rl.data_q.rx_prod -% rl.data_q.rx_cons + 64 + rx_win_pkts < uapi.ring_desc_cnt - 16) {
++                                        rl.data_q.postDdpDrain(rx_win_iova, 64);
++                                    }
++                                    last_rx_activity = rx_drain_since;
++                                }
++                            }
++                        }
++
++                        // RX DDP retry / stall timers (only while still receiving a window)
++                        if (!rx_done and !rx_draining) {
++                            const tr = nowNs();
++                            if (rx_skip == 0 and rx_got == 0 and (tr - last_cts_tx) >= 1_000_000) {
++                                const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                                if (@as(i32, @bitCast(rl.peer_max_seq -% seq32)) >= 0 and (tr - last_rx_activity) >= 50_000_000 and
++                                    rem + rx_win_pkts < uapi.ring_desc_cnt - 16)
++                                {
++                                    rx_skip = rem;
++                                    rx_got = 0;
++                                    rx_gap = false;
++                                    rx_cts_gen +%= 1;
++                                    rl.retrans_cnt += 1;
++                                    rl.data_q.postDdpRx(rx_win_iova, rx_win_pkts);
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.nack),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rem),
++                                        .cts_gen = rx_cts_gen,
++                                    });
++                                    last_rx_activity = tr;
++                                    last_cts_tx = tr;
++                                } else {
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.cts),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rx_win_pkts),
++                                        .cts_gen = rx_cts_gen,
++                                    });
++                                    last_cts_tx = tr;
++                                }
++                            }
++                            if ((rx_skip > 0 or (rx_got > 0 and rx_got < rx_win_pkts)) and !drained_any and (tr - last_rx_activity) >= 5_000_000) {
++                                const rem: u32 = rl.data_q.rx_prod -% rl.data_q.rx_cons;
++                                if (rem + rx_win_pkts < uapi.ring_desc_cnt - 16) {
++                                    rx_skip = rem;
++                                    rx_got = 0;
++                                    rx_gap = false;
++                                    rx_cts_gen +%= 1;
++                                    rl.retrans_cnt += 1;
++                                    rl.data_q.postDdpRx(rx_win_iova, rx_win_pkts);
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.nack),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rem),
++                                        .cts_gen = rx_cts_gen,
++                                    });
++                                } else if (rx_skip > 0 and rx_got == 0) {
++                                    rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                                        .opcode = @intFromEnum(Op.nack),
++                                        .seq = seq32,
++                                        .win_start = rx_win_start,
++                                        .win_pkts = @intCast(rx_skip),
++                                        .cts_gen = rx_cts_gen,
++                                    });
++                                }
++                                last_rx_activity = tr;
++                            }
++                        }
++                    },
++                }
++            }
++
++            // 2. Progress TX DDP side.
++            if (!tx_done) {
++                if (rl.stashed_cts.valid and rl.stashed_cts.seq == seq32 and rl.stashed_cts.win_start == tx_win_start) {
++                    if (!tx_allowed or rl.stashed_cts.cts_gen != peer_cts_gen) {
++                        peer_cts_gen = rl.stashed_cts.cts_gen;
++                        tx_allowed = true;
++                        tx_sent = 0;
++                        tx_flush = 0;
++                    }
++                    rl.stashed_cts.valid = false;
++                }
++                if (rl.has_stashed_ack and rl.stashed_ack_seq == seq32 and rl.stashed_ack_win == tx_win_start) {
++                    if (tx_sent == tx_win_pkts) {
++                        tx_acked = true;
++                    } else {
++                        std.log.warn("mgbe_zc port {d} seq {d}: ignoring premature ACK (tx_sent={d}/{d} tx_allowed={})", .{ rl.port, seq32, tx_sent, tx_win_pkts, tx_allowed });
++                    }
++                    rl.has_stashed_ack = false;
++                }
++                if (rl.has_stashed_nack and rl.stashed_nack_seq == seq32 and rl.stashed_nack_win == tx_win_start) {
++                    if (rl.stashed_nack_gen != peer_cts_gen) {
++                        peer_cts_gen = rl.stashed_nack_gen;
++                        tx_flush = rl.stashed_nack_flush;
++                        tx_sent = 0;
++                        tx_allowed = true;
++                        rl.retrans_cnt += 1;
++                    }
++                    rl.has_stashed_nack = false;
++                }
++                if (!tx_acked and tx_sent == tx_win_pkts and (@as(i32, @bitCast(rl.peer_max_seq -% seq32)) > 0 or
++                    (rl.stashed_cts.valid and rl.stashed_cts.seq == seq32 and rl.stashed_cts.win_start > tx_win_start)))
++                {
++                    tx_acked = true;
++                }
++
++                if (tx_acked) {
++                    tx_win_start += tx_win_pkts;
++                    if (tx_win_start >= tx_total_pkts) {
++                        tx_done = true;
++                    } else {
++                        tx_win_pkts = @min(bulk_win_max_pkts, tx_total_pkts - tx_win_start);
++                        tx_allowed = false;
++                        tx_sent = 0;
++                        tx_flush = 0;
++                        tx_acked = false;
++                        peer_cts_gen = 0;
++                        last_ack_req_tx = nowNs();
++                    }
++                } else {
++                    if (tx_allowed and (tx_flush > 0 or tx_sent < tx_win_pkts)) {
++                        var sent_now: u32 = 0;
++                        while (tx_flush > 0 and sent_now < tx_batch_pkts) {
++                            const ring_db = (sent_now + 1 == tx_batch_pkts) or (tx_flush == 1 and tx_sent == tx_win_pkts);
++                            rl.data_q.sendGather(
++                                uapi.ethtype_data,
++                                rl.local_mac,
++                                rl.peer_mac,
++                                .{
++                                    .opcode = @intFromEnum(Op.bulk_data),
++                                    .seq = seq32,
++                                    .win_start = tx_win_start,
++                                    .psn = 0xFFFFFFFF,
++                                    .win_pkts = @intCast(tx_win_pkts),
++                                    .nbytes = tx_nbytes,
++                                    .cts_gen = peer_cts_gen,
++                                },
++                                send_iova,
++                                16,
++                                ring_db,
++                            );
++                            tx_flush -= 1;
++                            sent_now += 1;
++                        }
++                        while (tx_flush == 0 and tx_sent < tx_win_pkts and sent_now < tx_batch_pkts) {
++                            const global_p = tx_win_start + tx_sent;
++                            const po = @as(usize, global_p) * max_payload;
++                            const plen: u32 = @intCast(@min(max_payload, tx_len - po));
++                            const ring_db = (sent_now + 1 == tx_batch_pkts) or (tx_sent + 1 == tx_win_pkts);
++                            rl.data_q.sendGather(
++                                uapi.ethtype_data,
++                                rl.local_mac,
++                                rl.peer_mac,
++                                .{
++                                    .opcode = @intFromEnum(Op.bulk_data),
++                                    .seq = seq32,
++                                    .win_start = tx_win_start,
++                                    .psn = tx_sent,
++                                    .win_pkts = @intCast(tx_win_pkts),
++                                    .nbytes = tx_nbytes,
++                                    .cts_gen = peer_cts_gen,
++                                },
++                                send_iova + po,
++                                plen,
++                                ring_db,
++                            );
++                            tx_sent += 1;
++                            sent_now += 1;
++                        }
++                        if (tx_sent == tx_win_pkts) last_ack_req_tx = nowNs();
++                    }
++                    const tt = nowNs();
++                    if (!tx_allowed and tx_win_start == 0 and (tt - last_rts_tx) >= 500_000) {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.rts),
++                            .seq = seq32,
++                            .nbytes = tx_nbytes,
++                        });
++                        last_rts_tx = tt;
++                    }
++                    if (tx_allowed and tx_sent == tx_win_pkts and (tt - last_ack_req_tx) >= 2_000_000) {
++                        rl.ctrl_q.sendCtrlHdr(rl.local_mac, rl.peer_mac, .{
++                            .opcode = @intFromEnum(Op.ack_req),
++                            .seq = seq32,
++                            .win_start = tx_win_start,
++                            .win_pkts = @intCast(tx_win_pkts),
++                        });
++                        last_ack_req_tx = tt;
++                    }
++                }
++            }
++
++            // 3. Peer arrival & timeout checks.
++            const t = nowNs();
++            if (!peer_seen and @as(i32, @bitCast(rl.peer_max_seq -% seq32)) >= 0) {
++                peer_seen = true;
++                t_xfer = t;
++                last_rx_activity = t;
++            }
++            const timed_out = if (peer_seen) (t - t_xfer >= s.timeout_ns) else (t - t_start >= s.arrival_timeout_ns);
++            if (timed_out) {
++                std.log.err(
++                    "mgbe_zc timeout port {d} DDP seq {d} (rx_mode={s} rx_done={} rx={d}/{d} win={d} skip={d} drain={} tx_done={} tx={d}/{d} win={d} allowed={} peer_max_seq={d} peer_seen={} retrans={d})",
++                    .{ rl.port, seq32, @tagName(rx_mode), rx_done, rx_got, rx_win_pkts, rx_win_start, rx_skip, rx_draining, tx_done, tx_sent, tx_win_pkts, tx_win_start, tx_allowed, rl.peer_max_seq, peer_seen, rl.retrans_cnt },
++                );
++                rl.ctrl_q.dumpState("ctrl_q");
++                rl.data_q.dumpState("data_q");
++                s.noteErr("port {d} DDP seq {d} timed out (rx_done={} tx_done={} retrans={d})", .{ rl.port, seq32, rx_done, tx_done, rl.retrans_cnt });
++                return error.ProxyFailed;
++            }
++        }
++        rl.ddp_cnt += 1;
++    }
++
++    fn publishDone(s: *State, q: u64) void {
++        const slot: usize = @intCast(q & s.slot_mask);
++        const prev = s.arrived[slot].fetchAdd(1, .acq_rel);
++        if (prev + 1 == s.n_ports) {
++            s.arrived[slot].store(0, .monotonic);
++            // Publish sent[slot] before flagAt(q, peer) so the next stage(q + slots) always sees sent >= q.
++            @atomicStore(u64, &s.sent()[slot], q, .release);
++            @atomicStore(u64, s.flagAt(q, 1 - s.rank), q, .release);
++        }
++    }
++
++    fn railWorker(s: *State, rail_idx: usize) void {
++        const rl = &s.rails[rail_idx];
++        placeRailWorker(rail_idx, rl.pin_cpu);
++        const naps = s.idle_ns > 0;
++        if (naps and comptime builtin.os.tag == .linux) _ = prctl(pr_set_timerslack, 1000, 0, 0, 0);
++        var quiet: u64 = 0;
++        var quiet_since: u64 = nowNs();
++        var drowsy = false;
++
++        while (s.running.load(.monotonic)) {
++            if (s.aborted()) break;
++            const rx_busy = s.drainCtrlRx(rl);
++            const ring_seq = @atomicLoad(u64, s.doorbell(), .acquire);
++            if (ring_seq == rl.last_seq) {
++                if (rx_busy) {
++                    drowsy = false;
++                    quiet = 0;
++                    continue;
++                }
++                quiet += 1;
++                if ((quiet & 63) == 0) {
++                    rl.ctrl_q.reclaimTx();
++                    rl.data_q.reclaimTx();
++                }
++                if (!naps) continue;
++                if (drowsy) {
++                    nap(s.nap_ns);
++                    continue;
++                }
++                if (quiet == 1) {
++                    quiet_since = nowNs();
++                } else if ((quiet & 1023) == 0 and nowNs() -% quiet_since > s.idle_ns) {
++                    drowsy = true;
++                }
++                continue;
++            }
++            drowsy = false;
++            quiet = 0;
++
++            if (ring_seq < rl.last_seq or ring_seq - rl.last_seq > s.slots) {
++                s.noteErr("port {d}: doorbell skipped ({d} -> {d})", .{ rl.port, rl.last_seq, ring_seq });
++                s.reportFailure();
++                break;
++            }
++            var q = rl.last_seq + 1;
++            while (q <= ring_seq) : (q += 1) {
++                const slot: usize = @intCast(q & s.slot_mask);
++                const nb64 = @atomicLoad(u64, &s.sizes()[slot], .acquire);
++                if (nb64 % 16 != 0 or nb64 > s.layout.slot_bytes) {
++                    s.noteErr("port {d}: bad shard size {d} at seq {d}", .{ rl.port, nb64, q });
++                    s.reportFailure();
++                    break;
++                }
++                s.runExchange(rl, q, @intCast(nb64)) catch {
++                    s.reportFailure();
++                    break;
++                };
++                rl.last_seq = q;
++                rl.last_seq32 = @truncate(q);
++                s.publishDone(q);
++            }
++            if (s.aborted()) break;
++        }
++
++        // Keep draining ctrl_q until teardown so peer retries never back up the MAC RX FIFO
++        // (which would otherwise starve VDMA 0/1 TCP/liveness/SSH on the shared port).
++        while (s.running.load(.monotonic)) {
++            while (rl.ctrl_q.peekCtrl()) |_| rl.ctrl_q.consumeCtrl();
++            nap(100_000);
++        }
++    }
++};
++
++test "mgbe_zc Layout aligns send, recv and meta cleanly for dsv41 Ring" {
++    const l = try Layout.of(2, 20 << 20);
++    try std.testing.expectEqual(@as(usize, 0), l.send_off);
++    try std.testing.expectEqual(@as(usize, 20 << 20), l.slot_bytes);
++    try std.testing.expectEqual(@as(usize, 0), l.recv_off % Layout.section_align);
++    try std.testing.expectEqual(@as(usize, 0), l.meta_off % Layout.section_align);
++    try std.testing.expect(l.send_off + l.send_len <= l.recv_off);
++    try std.testing.expect(l.recv_off + l.recv_len <= l.meta_off);
++    try std.testing.expectEqual(l.send_off + l.slot_bytes, l.sendAt(1));
++    try std.testing.expectEqual(l.recv_off + 3 * l.slot_bytes, l.recvAt(1, 1));
++    try std.testing.expectError(error.BadLayout, Layout.of(1, 4096));
++    try std.testing.expectError(error.BadLayout, Layout.of(3, 4096));
++}
++
++test "mgbe_zc stripeFor covers every byte without overlap including 0 and uneven sizes" {
++    for ([_]usize{ 0, 16, 48, 64, 4096, 32768, 131072, (16 << 20) - 16, 20 << 20 }) |nb| {
++        for ([_]usize{ 1, 2, 4 }) |np| {
++            var total: usize = 0;
++            for (0..np) |r| {
++                const st = stripeFor(nb, r, np);
++                try std.testing.expectEqual(total, st.off);
++                try std.testing.expectEqual(@as(usize, 0), st.len % 16);
++                total += st.len;
++            }
++            try std.testing.expectEqual(nb, total);
++        }
++    }
++}
++
++test "mgbe_zc EagerSlot handles 0-packet and multi-packet completions" {
++    var z: EagerSlot = .{ .seq = 1, .mask = 0, .total_pkts = 0, .nbytes = 0 };
++    try std.testing.expect(!z.done());
++    z.mask = 1;
++    try std.testing.expect(z.done());
++
++    var m: EagerSlot = .{ .seq = 2, .mask = 0, .total_pkts = 4, .nbytes = 32768 };
++    try std.testing.expect(!m.done());
++    m.mask = 0b0111;
++    try std.testing.expect(!m.done());
++    m.mask = 0b1111;
++    try std.testing.expect(m.done());
++}
++
++test "mgbe_zc Info is an extern struct safe for wire exchange" {
++    try std.testing.expectEqual(@as(usize, 64), @sizeOf(Info));
++}
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index aa68d3d..39294e2 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -272,7 +272,7 @@ pub const Model = struct {
+         // carry the owner layout and the part salt; spill_state packs a sharded plane's part-local rows)
+         m.request_cap = pl.extent;
+         m.window_cap = pl.window;
+-        // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
++        // TP2: the decode gathers' RDMA ring (both ranks connect before either returns), or /dev/mgbe_zc on Thor
+         if (sp.pair == null and o.rdma_devices != null) {
+             const list = o.rdma_devices.?;
+             if (!cuda.kernels.available) return error.NoKernelImages;
+@@ -281,6 +281,17 @@ pub const Model = struct {
+             var it = std.mem.splitScalar(u8, list, ',');
+             while (it.next()) |dev| try devices.append(a, dev);
+             m.ring = try openRing(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, &m.comm, m.stream);
++        } else if (sp.pair == null and o.world == 2 and rdma.mgbe_zc.wanted(o.world)) {
++            if (cuda.kernels.available) {
++                var rmod = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
++                errdefer rmod.unload();
++                if (try openMgbeZcRing(gpa, d, try rdma.Kernels.load(rmod), o.rank, &m.comm, m.stream)) |ring| {
++                    m.rdma_mod = rmod;
++                    m.ring = ring;
++                } else {
++                    rmod.unload();
++                }
++            }
+         }
+         errdefer if (m.ring) |r| r.destroy(gpa);
+         errdefer if (m.rdma_mod) |*x| x.unload();
+@@ -600,6 +611,74 @@ pub const Model = struct {
+         return r;
+     }
+ 
++    /// TP2's /dev/mgbe_zc 4x25GbE zero-copy ring (Jetson AGX Thor): both ranks open, exchange port MACs over NCCL,
++    /// run the L2 ctrl+DDP probe, and agree before starting workers; if either rank cannot bring it up, both fall back
++    /// cleanly to NCCL.
++    pub fn openMgbeZcRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !?*rdma.Ring {
++        if (comm.world != 2) return null;
++        const max_bytes = rdma.mgbe_zc.maxBytesFromEnv();
++        var r_opt: ?*rdma.Ring = rdma.Ring.createMgbeZc(gpa, d, k, rank, .{
++            .slots = rdma.mgbe_zc.default_slots,
++            .max_bytes = max_bytes,
++        }) catch |e| blk: {
++            std.log.warn("dsv41: mgbe_zc ring setup skipped ({s}); NCCL carries every gather", .{@errorName(e)});
++            break :blk null;
++        };
++        errdefer if (r_opt) |r| r.destroy(gpa);
++
++        const per = @sizeOf(rdma.mgbe_zc.Info);
++        const mine: rdma.mgbe_zc.Info = if (r_opt) |r| r.zcInfo() else .{};
++        var dev = try cuda.DeviceBuffer.alloc(d, 3 * per);
++        defer dev.free();
++        try dev.upload(0, std.mem.asBytes(&mine));
++        try comm.allGather(dev.ptr, dev.ptr + per, per, .u8, stream);
++        try stream.synchronize();
++        var all: [2]rdma.mgbe_zc.Info = undefined;
++        try dev.download(per, std.mem.sliceAsBytes(&all));
++
++        const peer_info = all[1 - rank];
++        if (r_opt == null or peer_info.ok == 0 or peer_info.n_ports != mine.n_ports or peer_info.slot_bytes != mine.slot_bytes) {
++            if (r_opt) |r| {
++                r.destroy(gpa);
++                r_opt = null;
++            }
++            return null;
++        }
++        const r = r_opt.?;
++        r.connectMgbeZc(peer_info) catch |e| {
++            std.log.warn("dsv41: mgbe_zc ring connect failed ({s}); NCCL carries every gather", .{@errorName(e)});
++            r.destroy(gpa);
++            r_opt = null;
++            return null;
++        };
++
++        // Barrier so both ranks have queues started and peer MACs loaded before probing the wire.
++        try comm.allGather(dev.ptr, dev.ptr + per, 1, .u8, stream);
++        try stream.synchronize();
++
++        const verdict: u8 = blk: {
++            r.probeMgbeZc() catch |e| {
++                std.log.err("dsv41: mgbe_zc wire probe failed ({s}: {s})", .{ @errorName(e), r.zcLastErr() });
++                break :blk 0;
++            };
++            break :blk 1;
++        };
++        try dev.upload(0, &[_]u8{verdict});
++        try comm.allGather(dev.ptr, dev.ptr + per, 1, .u8, stream);
++        try stream.synchronize();
++        var verdicts: [2]u8 = .{ 0, 0 };
++        try dev.download(per, &verdicts);
++        if (verdicts[0] == 0 or verdicts[1] == 0) {
++            std.log.warn("dsv41: mgbe_zc wire probe failed on a rank; NCCL carries every gather", .{});
++            r.destroy(gpa);
++            r_opt = null;
++            return null;
++        }
++        try r.start();
++        std.log.info("dsv41: mgbe_zc ring active (2 ranks, {d} rail(s), slots up to {d} KiB)", .{ r.zcPorts(), r.s.max_bytes >> 10 });
++        return r;
++    }
++
+     fn readKit(a: std.mem.Allocator, io: std.Io, kit: []const u8, name: []const u8) ![]const u8 {
+         return std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ kit, "cubins", name }), a, .limited(1 << 28), .@"16", null);
+     }
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index d77e94b..9a36e68 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -138,9 +138,12 @@ pub const Engine = struct {
+     kv: ?*shard_ops.KvShard = null, // TF_DS_KV_SHARD: the parts, the decode mode, the fetch kernels (null: replicated)
+ 
+     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
+-    /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
++    /// one and the slice fits a slot (whole float4s), or chunked over /dev/mgbe_zc on Thor, else NCCL. The same bytes either way.
+     pub fn gatherF32(e: *const Engine, src: u64, dst: u64, count: usize) !void {
+-        if (e.ring) |r| if (count % 4 == 0 and count * 4 <= r.s.max_bytes) return r.gather(e.s, src, @intCast(count / 4), dst);
++        if (e.ring) |r| if (count % 4 == 0) {
++            if (count * 4 <= r.s.max_bytes) return r.gather(e.s, src, @intCast(count / 4), dst);
++            if (r.isMgbeZc()) return r.gatherChunked(e.s, src, count / 4, dst);
++        };
+         return e.comm.allGather(src, dst, count, .f32, e.s);
+     }
+ 
+@@ -1316,7 +1319,13 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
+         std.debug.assert(0 < h0 and h0 < n and big <= n);
+         const row = kk * 8;
+         const send = if (e.comm.rank == 0) ch.cidx else ch.cidx + (n - big) * row;
+-        try e.comm.allGather(send, ch.keys, big * kk, .i64, e.s);
++        if (e.ring) |r| if (r.isMgbeZc() and (big * kk * 8) % 16 == 0) {
++            try e.gatherF32(send, ch.keys, big * kk * 2);
++        } else {
++            try e.comm.allGather(send, ch.keys, big * kk, .i64, e.s);
++        } else {
++            try e.comm.allGather(send, ch.keys, big * kk, .i64, e.s);
++        }
+         if (e.comm.rank == 0) {
+             try e.ops.copyRows(e.s, ch.keys + (big + h0 + big - n) * row, row, ch.cidx + h0 * row, row, row, n - h0);
+         } else {
+@@ -1341,6 +1350,7 @@ pub fn scale(hd: usize) f32 {
+ /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
+ pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+     if (e.two) |t| return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
++    if (e.ring) |r| if (r.isMgbeZc()) return e.gatherF32(src, dst, ch.n * e.c.hidden);
+     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
+ }
+ 
+@@ -1616,7 +1626,11 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
+         try e.two.?.engramSum(e, ch.ek, ch.ekg, ch.kv, n);
+         if (prof) eh.p_x += lap(e, eh, &tq);
+     } else {
+-        if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
++        if (e.two) |two|
++            try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4)
++        else if (e.ring) |r| {
++            if (r.isMgbeZc()) try e.gatherF32(ch.ek, ch.ekg, n * ew.n) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
++        } else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+         if (prof) eh.p_x += lap(e, eh, &tq);
+         if (e.world != 2) return notPorted(@src()); // Comm.sum of more ranks: acc += g[r]
+         try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
+@@ -1747,6 +1761,7 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
+     const hl = e.w.head;
+     try mmRows(e, ch, 1, hl, ch.head_x, c.hidden, ch.head_l, .fp32, hl.n);
+     if (e.two) |t| return t.quarters(e, ch.head_l, ch.head_g, 1, t.hw, 4); // 2D: the vocabulary quarters, TP2's layout
++    if (e.ring) |r| if (r.isMgbeZc()) return e.gatherF32(ch.head_l, ch.head_g, hl.n);
+     try e.comm.allGather(ch.head_l, ch.head_g, hl.n, .f32, e.s);
+ }
+ 
+diff --git a/zig/src/families/dsv41/rdma.zig b/zig/src/families/dsv41/rdma.zig
+index 9085c65..ba34acc 100644
+--- a/zig/src/families/dsv41/rdma.zig
++++ b/zig/src/families/dsv41/rdma.zig
+@@ -10,6 +10,7 @@ const cuda = @import("cuda");
+ const fabric = @import("fabric");
+ const seqs = @import("rdma_seq.zig");
+ const env = @import("rdma_env.zig");
++pub const mgbe_zc = @import("mgbe_zc.zig");
+ 
+ const vabi = fabric.verbs_abi;
+ const Verbs = fabric.verbs.Verbs;
+@@ -31,7 +32,7 @@ const default_nap_ns: u64 = 100 * std.time.ns_per_us;
+ 
+ extern "c" fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) c_int;
+ 
+-pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, RingOrder, BadRdmaIdle, BadRdmaNap } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
++pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, RingFailed, NoHostRegister, RingOrder, BadRdmaIdle, BadRdmaNap } || mgbe_zc.Error || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+ 
+ /// TF_RDMA_IDLE_S: seconds with nothing posted or reaped before the proxy naps (0: never nap; default 2).
+ fn parseIdleNs(text: []const u8) Error!u64 {
+@@ -223,13 +224,14 @@ pub const RowPairing = struct {
+ 
+ pub const Ring = struct {
+     d: *const cuda.Driver,
+-    verbs: Verbs,
++    verbs: ?Verbs = null,
+     v: *const Verbs = undefined,
++    zc: ?*mgbe_zc.State = null,
+     k: Kernels,
+     s: Settings,
+     rank: u32,
+     world: u32,
+-    hr: HostReg,
++    hr: ?HostReg = null,
+     send: Pinned,
+     recv: Pinned,
+     meta: Pinned,
+@@ -289,8 +291,8 @@ pub const Ring = struct {
+         var scalars = try cuda.DeviceBuffer.alloc(d, 80);
+         errdefer scalars.free();
+         try scalars.fill8(0, null);
+-        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars, .idle_ns = idle_ns, .nap_ns = nap_ns };
+-        r.v = &r.verbs;
++        r.* = .{ .d = d, .verbs = verbs, .zc = null, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars, .idle_ns = idle_ns, .nap_ns = nap_ns };
++        r.v = &r.verbs.?;
+         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
+         for (devices) |name| {
+             r.nics[r.nd] = try r.openNic(name);
+@@ -299,6 +301,69 @@ pub const Ring = struct {
+         return r;
+     }
+ 
++    /// Two-rank /dev/mgbe_zc ring backed by a single CUDA VMM HOST_NUMA region (send + recv + meta).
++    /// Call `zcInfo`, exchange with the peer, `connectMgbeZc`, barrier, `probeMgbeZc`, then `start`.
++    pub fn createMgbeZc(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, rank: u32, s: Settings) Error!*Ring {
++        if (rank >= 2) return error.BadInfo;
++        const slots = if (s.slots == 0) mgbe_zc.default_slots else s.slots;
++        const idle_ns = try envIdleNs();
++        const nap_ns = try envNapNs();
++        const r = try gpa.create(Ring);
++        errdefer gpa.destroy(r);
++        const zc = try mgbe_zc.State.create(gpa, d, rank, slots, s.max_bytes, idle_ns, nap_ns);
++        errdefer zc.destroy();
++        var scalars = try cuda.DeviceBuffer.alloc(d, 80);
++        errdefer scalars.free();
++        try scalars.fill8(0, null);
++        var set = s;
++        set.slots = slots;
++        set.max_bytes = zc.layout.slot_bytes;
++        r.* = .{
++            .d = d,
++            .verbs = null,
++            .zc = zc,
++            .k = k,
++            .s = set,
++            .rank = rank,
++            .world = 2,
++            .hr = null,
++            .send = .{ .mem = zc.sendSlice(), .dev = zc.sendDev() },
++            .recv = .{ .mem = zc.recvSlice(), .dev = zc.recvDev() },
++            .meta = .{ .mem = zc.metaSlice(), .dev = zc.metaDev() },
++            .scalars = scalars,
++            .idle_ns = idle_ns,
++            .nap_ns = nap_ns,
++        };
++        return r;
++    }
++
++    pub fn isMgbeZc(r: *const Ring) bool {
++        return r.zc != null;
++    }
++
++    pub fn zcPorts(r: *const Ring) u32 {
++        return if (r.zc) |zc| zc.n_ports else 0;
++    }
++
++    pub fn zcInfo(r: *const Ring) mgbe_zc.Info {
++        return if (r.zc) |zc| zc.info() else .{};
++    }
++
++    pub fn zcLastErr(r: *const Ring) []const u8 {
++        return if (r.zc) |zc| zc.lastErr() else "";
++    }
++
++    pub fn connectMgbeZc(r: *Ring, peer: mgbe_zc.Info) Error!void {
++        const zc = r.zc orelse return error.BadInfo;
++        try zc.connect(peer);
++        r.s.max_bytes = zc.max_bytes;
++    }
++
++    pub fn probeMgbeZc(r: *Ring) Error!void {
++        const zc = r.zc orelse return error.BadInfo;
++        try zc.probeAll();
++    }
++
+     fn openNic(r: *Ring, name: []const u8) Error!Nic {
+         const api = r.v.api;
+         const ctx = try r.v.openDevice(name);
+@@ -347,13 +412,22 @@ pub const Ring = struct {
+ 
+     pub fn destroy(r: *Ring, gpa: std.mem.Allocator) void {
+         r.stop();
++        if (r.zc) |zc| {
++            r.scalars.free();
++            zc.destroy();
++            r.zc = null;
++            gpa.destroy(r);
++            return;
++        }
+         for (r.nics[0..r.nd]) |*n| r.closeNic(n);
+         r.scalars.free();
+-        r.meta.free(&r.hr);
+-        r.recv.free(&r.hr);
+-        r.send.free(&r.hr);
+-        r.hr.lib.close();
+-        r.verbs.close();
++        if (r.hr) |*hr| {
++            r.meta.free(hr);
++            r.recv.free(hr);
++            r.send.free(hr);
++            hr.lib.close();
++        }
++        if (r.verbs) |*v| v.close();
+         gpa.destroy(r);
+     }
+ 
+@@ -400,12 +474,28 @@ pub const Ring = struct {
+         }
+     }
+ 
++    fn onZcFail(ctx: *anyopaque, why: []const u8) void {
++        const r: *Ring = @ptrCast(@alignCast(ctx));
++        r.fail(why);
++    }
++
+     pub fn start(r: *Ring) Error!void {
++        if (r.zc) |zc| {
++            if (r.running.swap(true, .acq_rel)) return;
++            errdefer r.running.store(false, .release);
++            try zc.start(.{ .ctx = r, .fail = onZcFail });
++            return;
++        }
+         if (r.running.swap(true, .acq_rel)) return;
+         r.proxy = try std.Thread.spawn(.{}, proxyLoop, .{r});
+     }
+ 
+     pub fn stop(r: *Ring) void {
++        if (r.zc) |zc| {
++            _ = r.running.swap(false, .acq_rel);
++            zc.stop();
++            return;
++        }
+         if (r.running.swap(false, .acq_rel)) if (r.proxy) |t| t.join();
+         r.proxy = null;
+     }
+@@ -553,6 +643,30 @@ pub const Ring = struct {
+         const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
+         try cuda.launch.launch(r.k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
+     }
++    /// All-gather of arbitrary `n4` float4s into `[world, n4 float4]`, splitting across multiple ring slots via
++    /// `gatherInto` when `n4 * 16 > r.s.max_bytes` (e.g., 20-100 MiB prefill / Engram gathers over mgbe_zc).
++    pub fn gatherChunked(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: usize, recv: DevicePtr) Error!void {
++        if (n4 == 0) return;
++        if (n4 * 16 <= r.s.max_bytes) return r.gather(stream, send, @intCast(n4), recv);
++        const max4: usize = r.s.max_bytes / 16;
++        if (max4 == 0) return error.TooLarge;
++        const rank_bytes: u64 = @as(u64, n4) * 16;
++        var off4: usize = 0;
++        var dsts: [max_ranks]Dst = @splat(.{});
++        while (off4 < n4) {
++            const c4: usize = @min(max4, n4 - off4);
++            const off_bytes: u64 = @as(u64, off4) * 16;
++            for (0..r.world) |p| {
++                dsts[p] = .{
++                    .ptr = recv + @as(u64, p) * rank_bytes + off_bytes,
++                    .row4 = @intCast(c4),
++                    .stride4 = @intCast(c4),
++                };
++            }
++            try r.gatherInto(stream, send + off_bytes, 1, @intCast(c4), dsts[0..r.world]);
++            off4 += c4;
++        }
++    }
+     /// A rank's slice in `dsts` (its rows `row4` float4 wide, `stride4` apart; ptr 0: not copied out).
+     pub const Dst = struct { ptr: DevicePtr = 0, row4: u32 = 0, stride4: u64 = 0 };
+     /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
+diff --git a/zig/src/families/dsv41/rdma_bench_main.zig b/zig/src/families/dsv41/rdma_bench_main.zig
+index 622f866..73aefe8 100644
+--- a/zig/src/families/dsv41/rdma_bench_main.zig
++++ b/zig/src/families/dsv41/rdma_bench_main.zig
+@@ -57,23 +57,47 @@ pub fn main(init: std.process.Init) !u8 {
+     const image = try std.Io.Dir.cwd().readFileAlloc(io, args[4], a, .limited(1 << 26));
+     var module = try cuda.Module.load(&driver, image);
+     defer module.unload();
+-    const r = try ring.Ring.create(init.gpa, &driver, try ring.Kernels.load(module), devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid });
++    const use_mgbe_zc = std.mem.eql(u8, args[5], "mgbe_zc");
++    const r = if (use_mgbe_zc) blk: {
++        if (world != 2) return error.BadRank;
++        const max_bytes = std.mem.alignForward(usize, @max(@as(usize, most) * width * 4, 65536), 4096);
++        const z = try ring.Ring.createMgbeZc(init.gpa, &driver, try ring.Kernels.load(module), rank, .{
++            .slots = ring.mgbe_zc.default_slots,
++            .max_bytes = max_bytes,
++            .pdl = pdl,
++        });
++        errdefer z.destroy(init.gpa);
++        const mine = z.zcInfo();
++        var table: [2]ring.mgbe_zc.Info = undefined;
++        try exchange(io, rank, 2, master, port, std.mem.asBytes(&mine), std.mem.sliceAsBytes(&table));
++        try z.connectMgbeZc(table[1 - rank]);
++        var one = [_]u8{1};
++        var all: [2]u8 = undefined;
++        try exchange(io, rank, 2, master, port, &one, &all);
++        try z.probeMgbeZc();
++        try exchange(io, rank, 2, master, port, &one, &all);
++        try z.start();
++        break :blk z;
++    } else blk: {
++        const rd = try ring.Ring.create(init.gpa, &driver, try ring.Kernels.load(module), devices.items, rank, world, .{ .max_bytes = std.mem.alignForward(usize, @as(usize, most) * width * 4, 64), .pdl = pdl, .gid_index = gid });
++        errdefer rd.destroy(init.gpa);
++        // every rank's info(p) for every p, gathered by rank 0 and handed back whole; then a barrier once all are connected
++        const row_bytes = @sizeOf(ring.Info) * world;
++        const mine = try a.alloc(u8, row_bytes);
++        for (0..world) |p| @memcpy(mine[p * @sizeOf(ring.Info) ..][0..@sizeOf(ring.Info)], std.mem.asBytes(&rd.info(@intCast(p))));
++        const table = try a.alloc(u8, row_bytes * world);
++        try exchange(io, rank, world, master, port, mine, table);
++        var remote: [ring.max_ranks]ring.Info = undefined;
++        for (0..world) |q| remote[q] = std.mem.bytesToValue(ring.Info, table[q * row_bytes + rank * @sizeOf(ring.Info) ..][0..@sizeOf(ring.Info)]);
++        try rd.connect(remote[0..world]);
++        var one = [_]u8{1};
++        const all = try a.alloc(u8, world);
++        try exchange(io, rank, world, master, port, &one, all);
++        try rd.start();
++        break :blk rd;
++    };
+     defer r.destroy(init.gpa);
+ 
+-    // every rank's info(p) for every p, gathered by rank 0 and handed back whole; then a barrier once all are connected
+-    const row_bytes = @sizeOf(ring.Info) * world;
+-    const mine = try a.alloc(u8, row_bytes);
+-    for (0..world) |p| @memcpy(mine[p * @sizeOf(ring.Info) ..][0..@sizeOf(ring.Info)], std.mem.asBytes(&r.info(@intCast(p))));
+-    const table = try a.alloc(u8, row_bytes * world);
+-    try exchange(io, rank, world, master, port, mine, table);
+-    var remote: [ring.max_ranks]ring.Info = undefined;
+-    for (0..world) |q| remote[q] = std.mem.bytesToValue(ring.Info, table[q * row_bytes + rank * @sizeOf(ring.Info) ..][0..@sizeOf(ring.Info)]);
+-    try r.connect(remote[0..world]);
+-    var one = [_]u8{1};
+-    const all = try a.alloc(u8, world);
+-    try exchange(io, rank, world, master, port, &one, all);
+-    try r.start();
+-
+     var stream = try cuda.Stream.init(&driver, true);
+     defer stream.deinit();
+     var out_buf: [4096]u8 = undefined;

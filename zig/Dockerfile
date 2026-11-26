@@ -63,7 +63,7 @@ RUN git init -q /tf-inputs && cd /tf-inputs && git remote add origin "${TF_REPO}
 COPY zig/patches-inputs /opt/tf-inputs-patches
 RUN cd /tf-inputs && \
     for p in /opt/tf-inputs-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done
-RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${SM} -Doptimize=ReleaseFast \
+RUN cd /tf-inputs && /opt/zig/zig build -Doptimize=ReleaseFast \
       --prefix /opt/inputs -j"$(nproc)" install && \
     test -x /opt/inputs/bin/tf-dsv41-rank-cache && \
     cp /opt/inputs/bin/tf-dsv41-rank-cache /opt/tensorfold/bin/ && \
@@ -74,6 +74,6 @@ RUN cd /tf-inputs && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dsm=${S
     rm -rf /tf-inputs /opt/inputs /root/.cache/zig
 
 ARG PATCHES_HASH
-LABEL tf.patches=${PATCHES_HASH} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF}
+LABEL tf.patches=${PATCHES_HASH} tf.sm=${SM} tf.engine=zig tf.ref=${TF_REF} tf.inputs=${INPUTS_REF}
 ENV PATH=/opt/tensorfold/native/bin:/opt/tensorfold/bin:${PATH}
 WORKDIR /workspace

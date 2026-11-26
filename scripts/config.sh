@@ -92,15 +92,31 @@ ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd50
 # ZIG_SHA256 wins. Set but empty (ZIG_MIRRORS=): ziglang.org only. Not part of the image hash (the bytes are pinned).
 ZIG_MIRRORS="${ZIG_MIRRORS-https://zig.linus.dev/zig}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
+# Target CUDA SASS architecture for zig/Dockerfile (-Dsm): auto detects from nvidia-smi (12.1 -> 121 on DGX Spark GB10,
+# 11.0 -> 110a on Jetson AGX Thor), falling back to 121 when nvidia-smi is unavailable. Explicit SM (e.g. 121 or 110a) wins.
+detect_sm() {
+  local cc num
+  cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+  [[ "$cc" =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  num=${cc//./}
+  if [[ "$num" == 110 ]]; then echo "110a"; else echo "$num"; fi
+}
+SM="${SM:-auto}"
+if [[ "$SM" == auto ]]; then
+  SM=$(detect_sm 2>/dev/null || echo 121)
+fi
+[[ "$SM" =~ ^[1-9][0-9]*a?(,[1-9][0-9]*a?)*$ ]] || { echo "ERROR: SM must be auto or a comma-separated CUDA SM list (e.g. 121, 110a), not '$SM'" >&2; exit 1; }
 image_hash() {
   ( cd "$_cfg_root" || exit 1
     cat zig/patches/*.patch 2>/dev/null
     cat zig/patches-inputs/*.patch 2>/dev/null
     cat zig/Dockerfile
     echo "$TF_REPO $TF_REF $INPUTS_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE"
+    [[ "$SM" == 121 ]] || echo "sm=$SM"
   ) | sha256sum | cut -c1-12
 }
 TAG_BASE="exl3-tp2"             # the image tag's prefix: <TAG_BASE>-<image hash>
+[[ "$SM" == 121 ]] || TAG_BASE="exl3-tp2-sm${SM//,/-}"
 IMAGE="${IMAGE:-tensorfold-dsv41:$TAG_BASE-$(image_hash)}"
 # A published image of these pins, if any (scripts/publish-image.sh pushes it; the registry handling is the GLM-5.3-Flash
 # recipe's): prepare.sh pulls $GHCR_IMAGE:<TAG_BASE>-<hash>, or, when IMAGE_TAG names that tag and IMAGE_DIGEST is set,
@@ -151,8 +167,24 @@ TOP_K="${TOP_K:-20}"
 DRAFTS="${DRAFTS:-1}"                  # the checkpoint's own DSpark draft blocks (exact: drafted replies equal plain)
 # The engine's settings as BertholomusAI's served two-node launch has them: CUDA graphs, the mixes' side stream, the
 # paced L2 prefetch, Engram reads by Linux AIO. RDMA: the decode-size exchanges between the nodes over RoCE instead of
-# NCCL, on each node's RoCE devices (scripts/nodes.sh finds them).
-RDMA="${RDMA:-1}"
+# NCCL, on each node's RoCE devices (scripts/nodes.sh finds them). auto enables RDMA=1 when both nodes have RoCE verbs
+# devices (DGX Spark) and RDMA=0 when they do not (Jetson AGX Thor Ethernet rails).
+RDMA="${RDMA:-auto}"
+# GPU container passthrough: auto uses --runtime=nvidia when Docker registers an nvidia runtime (Jetson AGX Thor /
+# JetPack) and --gpus all otherwise (DGX Spark). Set to gpus or runtime to override.
+GPU_RUNTIME="${GPU_RUNTIME:-auto}"
+# Non-RDMA Ethernet rail discovery (Jetson AGX Thor 4x25GbE MGBE): minimum physical link speed in Mb/s (excludes 1G LAN)
+# and the socket buffer ceiling (bytes) checked on both nodes.
+FABRIC_MIN_SPEED_MBPS="${FABRIC_MIN_SPEED_MBPS:-10000}"
+RAIL_TCP_BUFFER_BYTES="${RAIL_TCP_BUFFER_BYTES:-33554432}"
+# /dev/mgbe_zc 4x25GbE zero-copy TP=2 transport on Jetson AGX Thor (zig/patches/0070-dsv41-mgbe-zc-ring.patch).
+# auto: enabled when LINK_KIND=tcp and /dev/mgbe_zc exists on both nodes; on: require it; off: NCCL Socket TCP only.
+MGBE_ZC="${MGBE_ZC:-auto}"
+MGBE_ZC_GROUP="${MGBE_ZC_GROUP:-mgbe_zc}"      # host group owning /dev/mgbe_zc via udev rule (passed as --group-add)
+MGBE_ZC_MAX_KB="${MGBE_ZC_MAX_KB:-20480}"      # TF_MGBE_ZC_MAX_KB: max shard per rank (20 MiB covers full 2048-row prefill chunk)
+MGBE_ZC_EAGER_KB="${MGBE_ZC_EAGER_KB:-32}"     # TF_MGBE_ZC_EAGER_KB: per-rail eager (VDMA 2) vs DDP (VDMA 3) threshold
+MGBE_ZC_PORTS="${MGBE_ZC_PORTS:-}"             # TF_MGBE_ZC_PORTS: comma list of MGBE port indices (default: auto from live rails)
+MGBE_ZC_CPUS="${MGBE_ZC_CPUS:-}"               # TF_MGBE_ZC_CPUS: optional CPU affinity per rail worker (e.g. 2,3,4,5)
 # zig/patches/0010: the RDMA proxy naps once quiet for RDMA_IDLE_S seconds, RDMA_NAP_US between looks. 0 keeps the
 # always-spinning proxy (the stock engine's behavior). A decode round's gathers never see a nap.
 RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds
@@ -180,7 +212,16 @@ HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"
 DATA_SUB="tensorfold-dsv41/${MODEL_REVISION:0:8}"
 [[ "$ABLIT" != 1 ]] || DATA_SUB+="-ablit-${ABLIT_REVISION:0:8}"
 DATA_DIR="$HF_CACHE/$DATA_SUB"
-KIT_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
+KIT_SRC_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
+KIT_SUB="$KIT_SRC_SUB"
+[[ "$SM" == 121 ]] || KIT_SUB="${KIT_SRC_SUB}-sm${SM//,/-}"
+# Optional inputs for scripts/retarget_kit.py when SM != 121 (for the 3 cubins without embedded PTX):
+#   KIT_EXL3_SRC     directory with EXL3 linear*.cu sources (builds cubins/linear*.cubin for SM)
+#   KIT_PREBUILT_DIR target-arch kit directory supplying remaining no-PTX cubins (e.g. vision/torch_fmha_sm120.cubin)
+#   KIT_LIBTORCH     target-arch libtorch_cuda.so to extract vision/torch_fmha_sm120.cubin via cuobjdump
+KIT_EXL3_SRC="${KIT_EXL3_SRC:-}"
+KIT_PREBUILT_DIR="${KIT_PREBUILT_DIR:-}"
+KIT_LIBTORCH="${KIT_LIBTORCH:-}"
 # The worker reads this Spark's HF_CACHE over NFS (the recipe's only mode: one copy of the 196 GiB checkpoint, here): a
 # read-only docker volume NFS_VOLUME on the worker that prepare.sh creates (no sudo there). This Spark must export
 # NFS_PATH (default: HF_CACHE; "/" for an NFSv4 export with fsid=0) to the worker's address on its link. NFS_SERVER: the
@@ -188,6 +229,10 @@ KIT_SUB="tensorfold-dsv41/kit-${KIT_REF:0:8}"
 NFS_PATH="${NFS_PATH:-$HF_CACHE}"
 NFS_SERVER="${NFS_SERVER:-}"
 NFS_VOLUME="${NFS_VOLUME:-dsv41-1017-exl3-hf}"
+# Mount options for the worker's (and optional head's) NFS docker volume (addr=<server> is prepended). Default is
+# NFSv4.2 with nconnect=8 (DGX Spark); on Tegra/Thor kernels where NFSv3 is preferred, override in scripts/local.sh
+# (e.g. NFS_OPTS='vers=3,ro,rsize=1048576,wsize=1048576,hard,timeo=600').
+NFS_OPTS="${NFS_OPTS:-nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600}"
 # On the worker's own disk (paths on the worker): Engram's tables (a decode round reads ~70 random 4 KiB rows from
 # them; over NFS that took most of a round), and its weight file (~106 GB; written there by prepare.sh from the
 # checkpoint over NFS, so it never crosses the network twice).
@@ -291,7 +336,7 @@ prepared_state() {
   local i tpl f
   tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
     die "cannot hash model/chat_template.jinja (sha256sum)"
-  f=("model=$MODEL_ID@$(snapshot_rev)" "engram=$ENGRAM_ID@$(engram_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "engram=$ENGRAM_ID@$(engram_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF" "sm=$SM"
      "w=$(worker_host 1)" "wengram=$WORKER_ENGRAM_DIR" "wcache=$WORKER_CACHE_DIR" "ablit=$ABLIT"
      "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
      "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")

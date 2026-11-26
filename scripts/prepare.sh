@@ -57,16 +57,23 @@ need_worker 1
 worker 1 'docker info >/dev/null 2>&1' || die "$(worker_host 1) cannot talk to its docker daemon (docker group?)"
 worker 1 'nvidia-smi -L >/dev/null 2>&1' || warn "nvidia-smi failed on $(worker_host 1)"
 detect_links
-log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS); NFS from $(nfs_server 1)"
+if [[ "${LINK_KIND:-ib}" == tcp ]]; then
+  log "Link (Ethernet, no RDMA verbs): this node $HEAD_ADDR ($HEAD_DEV) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV) over $HEAD_TCP_RAILS rail(s); NFS from $(nfs_server 1)"
+else
+  log "Link: this node $HEAD_ADDR ($HEAD_DEV, RoCE $HEAD_HCAS) <-> $(worker_host 1) $WORKER_ADDR ($WORKER_DEV, RoCE $WORKER_HCAS); NFS from $(nfs_server 1)"
+fi
 
 # ---------------------------------------------------------------- 2. the image
 hash=$(image_hash)
 built=$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$IMAGE" 2>/dev/null || true)
+built_sm=$(docker image inspect -f '{{index .Config.Labels "tf.sm"}}' "$IMAGE" 2>/dev/null || true)
+[[ "$SM" == 121 || "$built_sm" == "$SM" ]] || built=""
 prebuilt=$(prebuilt_image)            # the pinned digest (config.sh's IMAGE_TAG / IMAGE_DIGEST), else the hash's tag
 if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
   log "Pulling the prebuilt image $prebuilt if there is one (PULL=0 builds instead)"
   if docker pull "$prebuilt" >/dev/null 2>&1 &&
-     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$hash" ]]; then
+     [[ "$(docker image inspect -f '{{index .Config.Labels "tf.patches"}}' "$prebuilt")" == "$hash" ]] &&
+     { [[ "$SM" == 121 ]] || [[ "$(docker image inspect -f '{{index .Config.Labels "tf.sm"}}' "$prebuilt" 2>/dev/null || true)" == "$SM" ]]; }; then
     docker tag "$prebuilt" "$IMAGE"; built=$hash
     log "Using $prebuilt as $IMAGE"
   else
@@ -75,18 +82,19 @@ if [[ $REBUILD -eq 0 && "${PULL:-1}" == 1 && "$built" != "$hash" ]]; then
 fi
 if [[ $REBUILD -eq 1 || "$built" != "$hash" ]]; then
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || { log "Pulling $BASE_IMAGE"; docker pull "$BASE_IMAGE" >/dev/null; }
-  log "Building $IMAGE (TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) engine + $(compgen -G 'zig/patches-inputs/*.patch' | wc -l) inputs patches, Zig $ZIG_VERSION; two Zig builds, ~6 min on a Spark)"
+  log "Building $IMAGE (SM=$SM, TensorFold ${TF_REF:0:12} + inputs' tools ${INPUTS_REF:0:12}, $(compgen -G 'zig/patches/*.patch' | wc -l) engine + $(compgen -G 'zig/patches-inputs/*.patch' | wc -l) inputs patches, Zig $ZIG_VERSION)"
   ctx=$(mktemp -d "$STATE_DIR/build.XXXXXX")
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/zig"; cp -r zig/patches "$ctx/zig/patches"; cp -r zig/patches-inputs "$ctx/zig/patches-inputs"; cp zig/Dockerfile "$ctx/Dockerfile"
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" -f "$ctx/Dockerfile" --build-arg BASE_IMAGE="$BASE_IMAGE" \
+    --build-arg SM="$SM" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" --build-arg INPUTS_REF="$INPUTS_REF" \
     --build-arg ZIG_VERSION="$ZIG_VERSION" --build-arg ZIG_SHA256="$ZIG_SHA256" --build-arg ZIG_MIRRORS="$ZIG_MIRRORS" \
     --build-arg PATCHES_HASH="$hash" "$ctx"
   rm -rf -- "$ctx"; trap - EXIT
 else
-  log "Image $IMAGE already built (hash $hash; --rebuild forces it)"
+  log "Image $IMAGE already built (hash $hash, SM=$SM; --rebuild forces it)"
 fi
 ident=$(image_ident "$IMAGE")
 if [[ "$(worker_image_ident 1 "$IMAGE")" != "$ident" ]]; then
@@ -193,15 +201,32 @@ if [[ "$ABLIT" == 1 ]]; then
 fi
 
 # ---------------------------------------------------------------- 4. the kit
-KIT_DIR="$HF_CACHE/$KIT_SUB"
-if [[ ! -d "$KIT_DIR/.git" ]]; then
+KIT_SRC_DIR="$HF_CACHE/$KIT_SRC_SUB"
+if [[ ! -d "$KIT_SRC_DIR/.git" ]]; then
   log "Fetching the kernel kit: $KIT_REPO @ ${KIT_REF:0:8}"
-  rm -rf "$KIT_DIR"; git init -q "$KIT_DIR"
-  git -C "$KIT_DIR" remote add origin "$KIT_REPO"
-  git -C "$KIT_DIR" fetch -q --depth 1 origin "$KIT_REF"
-  git -C "$KIT_DIR" checkout -q --detach FETCH_HEAD
+  rm -rf "$KIT_SRC_DIR"; git init -q "$KIT_SRC_DIR"
+  git -C "$KIT_SRC_DIR" remote add origin "$KIT_REPO"
+  git -C "$KIT_SRC_DIR" fetch -q --depth 1 origin "$KIT_REF"
+  git -C "$KIT_SRC_DIR" checkout -q --detach FETCH_HEAD
 fi
-[[ "$(git -C "$KIT_DIR" rev-parse HEAD)" == "$KIT_REF" ]] || die "$KIT_DIR is not at KIT_REF ${KIT_REF:0:8}: remove it and run this again"
+[[ "$(git -C "$KIT_SRC_DIR" rev-parse HEAD)" == "$KIT_REF" ]] || die "$KIT_SRC_DIR is not at KIT_REF ${KIT_REF:0:8}: remove it and run this again"
+KIT_DIR="$HF_CACHE/$KIT_SUB"
+if [[ "$SM" != 121 ]]; then
+  want_arch="sm_${SM%%,*}"
+  have_arch=""
+  if [[ -f "$KIT_DIR/kit/RETARGET.json" ]]; then
+    have_arch=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1])).get("target_arch",""))' "$KIT_DIR/kit/RETARGET.json" 2>/dev/null || true)
+  fi
+  if [[ $REBUILD -eq 1 || "$have_arch" != "$want_arch" ]]; then
+    log "Retargeting kernel kit $KIT_SRC_DIR/kit -> $KIT_DIR/kit ($want_arch)"
+    rt_args=(convert "$KIT_SRC_DIR/kit" "$KIT_DIR/kit" --arch "$want_arch")
+    [[ -z "$KIT_EXL3_SRC" ]] || rt_args+=(--exl3-src "$KIT_EXL3_SRC")
+    [[ -z "$KIT_PREBUILT_DIR" ]] || rt_args+=(--prebuilt-kit "$KIT_PREBUILT_DIR")
+    [[ -z "$KIT_LIBTORCH" ]] || rt_args+=(--libtorch "$KIT_LIBTORCH")
+    python3 ./scripts/retarget_kit.py "${rt_args[@]}" >/dev/null ||
+      die "failed to retarget kit to $want_arch (set KIT_EXL3_SRC / KIT_PREBUILT_DIR / KIT_LIBTORCH for the 3 no-PTX cubins)"
+  fi
+fi
 KIT_IN=/hf/$KIT_SUB/kit
 SNAP_C=$(model_in_container)
 TOOLS=/opt/tensorfold/tools/inputs

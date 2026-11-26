@@ -82,7 +82,7 @@ ensure_nfs_volume() {
   have=$(worker "$i" "docker volume inspect -f '{{index .Options \"device\"}} {{index .Options \"o\"}}' '$NFS_VOLUME'" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
     worker "$i" "docker volume create --driver local --opt type=nfs --opt device=':$NFS_PATH' \
-      --opt o='addr=$server,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600' '$NFS_VOLUME'" >/dev/null ||
+      --opt o='addr=$server,$NFS_OPTS' '$NFS_VOLUME'" >/dev/null ||
       die "could not create the docker volume $NFS_VOLUME on $h"
   elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$server,"* ]]; then
     die "$h's docker volume $NFS_VOLUME is ${have%% *} from ${have#* }, not :$NFS_PATH from $server: remove it there (docker volume rm $NFS_VOLUME) or set NFS_VOLUME / NFS_PATH / $(wvar NFS_SERVER "$i")"
@@ -242,10 +242,266 @@ probe_rails() {
   HEAD_HCAS=$(IFS=,; echo "${keep_h[*]}"); WORKER_HCAS=$(IFS=,; echo "${keep_w[*]}")
 }
 
+# Non-RDMA Ethernet fabric helpers (Jetson AGX Thor 4x25GbE MGBE), adapted from GLM-5.3-Flash Thor launcher.
+rdma_present() { compgen -G '/sys/class/infiniband/*' >/dev/null 2>&1; }
+
+# node_addrs <min speed Mb/s>: this node's IPv4 addresses on UP physical netdevs at or above that speed. Self-contained.
+node_addrs() {
+  local min=${1:-0} d n a mtu spd
+  for d in /sys/class/net/*; do
+    n=${d##*/}
+    [[ -e "$d/device" ]] || continue
+    [[ "$(cat "$d/operstate" 2>/dev/null)" == up ]] || continue
+    spd=$(cat "$d/speed" 2>/dev/null || echo 0)
+    case "$spd" in ''|*[!0-9]*) spd=0 ;; esac
+    (( spd >= min )) || continue
+    mtu=$(cat "$d/mtu" 2>/dev/null || echo 1500)
+    while read -r _ _ _ a _; do
+      [[ -n "$a" ]] || continue
+      printf '%s %s %s %s %s\n' "$n" "${a%%/*}" "${a##*/}" "$mtu" "$spd"
+    done < <(ip -o -4 addr show dev "$n" 2>/dev/null)
+  done
+}
+
+# fabric_pairs: direct subnet rail pairs between this node and worker 1 at or above FABRIC_MIN_SPEED_MBPS.
+fabric_pairs() {
+  local min=${FABRIC_MIN_SPEED_MBPS:-10000}
+  { node_addrs "$min"; printf -- '--\n'
+    worker 1 "$(declare -f node_addrs); node_addrs $min" 2>/dev/null || true
+  } | python3 -c '
+import ipaddress, sys
+mine, theirs, side = [], [], 0
+for line in sys.stdin:
+    line = line.strip()
+    if line == "--":
+        side = 1; continue
+    p = line.split()
+    if len(p) != 5: continue
+    (mine if side == 0 else theirs).append(p)
+def net(a, pfx):
+    try: return ipaddress.ip_network(f"{a}/{pfx}", strict=False)
+    except ValueError: return None
+def addr(a):
+    try: return ipaddress.ip_address(a)
+    except ValueError: return None
+for dev, ip, pfx, mtu, _ in sorted(mine, key=lambda x: x[0]):
+    ln, la = net(ip, pfx), addr(ip)
+    if ln is None or la is None: continue
+    for wdev, wip, wpfx, wmtu, _ in sorted(theirs, key=lambda x: x[0]):
+        wn, wa = net(wip, wpfx), addr(wip)
+        if wn is None or wa is None or la not in wn or wa not in ln: continue
+        print(dev, ip, wdev, wip, min(int(mtu), int(wmtu)), f"{mtu}/{wmtu}")
+'
+}
+
+tcp_buffer_ceiling() {
+  sysctl -n net.core.rmem_max net.core.wmem_max 2>/dev/null | sort -n | head -1
+}
+
+rail_tcp_buffers() {
+  local want=${RAIL_TCP_BUFFER_BYTES:-33554432} here there
+  [[ -z "${WORKER_DOWN[1]:-}" ]] || return 0
+  here=$(tcp_buffer_ceiling || true); here=${here:-0}
+  there=$(worker 1 "$(declare -f tcp_buffer_ceiling); tcp_buffer_ceiling" 2>/dev/null || true); there=${there:-0}
+  (( here >= want && there >= want )) && return 0
+  warn "socket buffer ceiling is $here bytes here and $there on $(worker_host 1); high-speed Ethernet rails want $want on both (sudo sysctl -w net.core.rmem_max=$want net.core.wmem_max=$want)"
+}
+
+# GPU passthrough & CUDA floor compatibility (Jetson AGX Thor / JetPack uses --runtime=nvidia and may report an older
+# driver CUDA minor than the PyTorch base image's NVIDIA_REQUIRE_CUDA).
+gpu_mode() {
+  local where=${1:-} runtimes
+  if [[ "$where" == worker ]]; then
+    [[ -z "${WORKER_DOWN[1]:-}" ]] && runtimes=$(worker 1 "docker info --format '{{json .Runtimes}}'" 2>/dev/null || true) || runtimes=""
+  else
+    runtimes=$(docker info --format '{{json .Runtimes}}' 2>/dev/null || true)
+  fi
+  case "${GPU_RUNTIME:-auto}" in
+    runtime) echo runtime ;;
+    gpus) echo gpus ;;
+    *) [[ "$runtimes" == *'"nvidia"'* ]] && echo runtime || echo gpus ;;
+  esac
+}
+
+driver_cuda() {
+  local s
+  if [[ "$1" == worker ]]; then
+    [[ -z "${WORKER_DOWN[1]:-}" ]] && s=$(worker 1 nvidia-smi 2>/dev/null || true) || s=""
+  else
+    s=$(nvidia-smi 2>/dev/null || true)
+  fi
+  sed -n 's/.*CUDA Version: *\([0-9][0-9.]*\).*/\1/p' <<<"$s" | head -1
+}
+
+image_cuda_require() {
+  local env
+  if [[ "$1" == worker ]]; then
+    [[ -z "${WORKER_DOWN[1]:-}" ]] && env=$(worker 1 "docker image inspect -f '{{json .Config.Env}}' '$IMAGE'" 2>/dev/null || true) || env=""
+  else
+    env=$(docker image inspect -f '{{json .Config.Env}}' "$IMAGE" 2>/dev/null || true)
+  fi
+  python3 -c 'import json, sys
+try: env = json.loads(sys.argv[1]) or []
+except Exception: sys.exit(0)
+print(next((e.split("=", 1)[1] for e in env if e.startswith("NVIDIA_REQUIRE_CUDA=")), ""))' "$env"
+}
+
+cuda_compat_args() {
+  local req drv out
+  req=$(image_cuda_require "$1"); drv=$(driver_cuda "$1")
+  [[ -n "$req" && -n "$drv" ]] || return 0
+  out=$(python3 - "$req" "$drv" <<'PY'
+import re, sys
+req, drv = sys.argv[1], sys.argv[2]
+m = re.search(r"cuda>=([0-9]+(?:\.[0-9]+)?)", req)
+if not m: sys.exit(0)
+key = lambda v: tuple(int(x) for x in v.split("."))
+if key(drv) >= key(m.group(1)): sys.exit(0)
+print(re.sub(r"cuda>=[0-9.]+", "cuda>=" + drv, req, count=1))
+PY
+  ) || true
+  [[ -z "$out" ]] || printf '%s\n' -e "NVIDIA_REQUIRE_CUDA=$out"
+}
+
+gpu_args() {
+  case "$(gpu_mode "$1")" in
+    runtime) printf '%s\n' --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all ;;
+    *) printf '%s\n' --gpus all ;;
+  esac
+  cuda_compat_args "$1"
+}
+
+infiniband_args() {
+  [[ "${LINK_KIND:-ib}" != tcp ]] || return 0
+  if [[ "$1" == worker ]]; then
+    [[ -n "${WORKER_DOWN[1]:-}" ]] || worker 1 'test -e /dev/infiniband' 2>/dev/null || return 0
+  else
+    [[ -e /dev/infiniband ]] || return 0
+  fi
+  printf '%s\n' --device /dev/infiniband
+}
+
+MGBE_ZC_GID_LOCAL=""
+MGBE_ZC_GID_WORKER=""
+
+# detect_mgbe_zc: resolve MGBE_ZC (auto|on|off) after detect_links and discover the /dev/mgbe_zc udev group GID on both nodes.
+detect_mgbe_zc() {
+  local here there ports
+  MGBE_ZC_GID_LOCAL=""; MGBE_ZC_GID_WORKER=""
+  if [[ "${LINK_KIND:-ib}" != tcp ]]; then
+    [[ "$MGBE_ZC" != on ]] || die "MGBE_ZC=on requires an Ethernet/MGBE link (LINK_KIND=tcp), not ${LINK_KIND:-ib}"
+    MGBE_ZC=off
+    return 0
+  fi
+  here=$([[ -c /dev/mgbe_zc ]] && echo yes || echo no)
+  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
+    there=$here
+  else
+    there=$(worker 1 'test -c /dev/mgbe_zc' >/dev/null 2>&1 && echo yes || echo no)
+  fi
+  ports="${MGBE_ZC_PORTS:-$LINK_ZC_PORTS}"
+  if [[ "$MGBE_ZC" == auto ]]; then
+    if [[ "$here" == yes && "$there" == yes && -n "$ports" ]]; then MGBE_ZC=on; else MGBE_ZC=off; fi
+  fi
+  if [[ "$MGBE_ZC" == on ]]; then
+    [[ "$here" == yes && "$there" == yes ]] || die "MGBE_ZC=on requires /dev/mgbe_zc on both nodes (here=$here, worker=$there). Load mgbe_zc.ko on both hosts or set MGBE_ZC=off"
+    [[ -n "$ports" ]] || die "MGBE_ZC=on requires at least one MTU>=8256 MGBE rail (set MGBE_ZC_PORTS or raise MTU to 9000)"
+    MGBE_ZC_GID_LOCAL=$(getent group "$MGBE_ZC_GROUP" 2>/dev/null | cut -d: -f3 || true)
+    if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
+      MGBE_ZC_GID_WORKER=$MGBE_ZC_GID_LOCAL
+    else
+      MGBE_ZC_GID_WORKER=$(worker 1 "getent group $(printf '%q' "$MGBE_ZC_GROUP") 2>/dev/null | cut -d: -f3" 2>/dev/null || true)
+    fi
+  fi
+}
+
+mgbe_zc_args() {
+  [[ "${MGBE_ZC:-off}" == on ]] || return 0
+  local gid
+  if [[ "$1" == worker ]]; then gid=${MGBE_ZC_GID_WORKER:-}; else gid=${MGBE_ZC_GID_LOCAL:-}; fi
+  printf '%s\n' --device /dev/mgbe_zc
+  [[ -z "$gid" ]] || printf '%s\n' --group-add "$gid"
+}
+
+LINK_KIND=""
+LINK_ZC_PORTS=""
+WORKER_ZC_PORTS=""
+HEAD_TCP_RAILS=0
+
+detect_link_tcp() {
+  local -a pairs=() keep=() zc_local=() zc_worker=()
+  local rail dev ip wdev wip mtu mtus ok first=1 filter_peer=${FABRIC_PEER:-}
+  if [[ -n "$filter_peer" && ! "$filter_peer" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    filter_peer=$(getent ahostsv4 "$filter_peer" | awk 'NR == 1 {print $1}') || true
+    [[ -n "$filter_peer" ]] || die "cannot resolve FABRIC_PEER=$FABRIC_PEER to an IPv4 address"
+  fi
+  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
+    LINK_KIND=tcp
+    HEAD_ADDR=${MASTER_ADDR:-"<head:tcp-addr>"}; WORKER_ADDR="<WORKER:tcp-addr>"
+    HEAD_DEV=${SOCKET_IFNAME:-"mgbe0_0,mgbe1_0,mgbe2_0,mgbe3_0"}; WORKER_DEV="$HEAD_DEV"
+    HEAD_HCAS=""; WORKER_HCAS=""; HEAD_GID=0; WORKER_GID=0; HEAD_TCP_RAILS=4
+    LINK_ZC_PORTS="0,1,2,3"; WORKER_ZC_PORTS="0,1,2,3"
+    NODE_DEV=("$HEAD_DEV" "$WORKER_DEV"); NODE_HCAS=("" ""); NODE_GID=(0 0)
+    LINK_HEAD_ADDR[1]=$HEAD_ADDR; LINK_WORKER_ADDR[1]=$WORKER_ADDR
+    MASTER_ADDR=${MASTER_ADDR:-$HEAD_ADDR}
+    [[ "$RDMA" != 1 ]] || warn "RDMA=1 but no RDMA verbs device is present: using RDMA=0 (NCCL Socket TCP)"
+    RDMA=0
+    return 0
+  fi
+  mapfile -t pairs < <(fabric_pairs)
+  (( ${#pairs[@]} )) || die "no RDMA verbs device and no direct Ethernet rail >= ${FABRIC_MIN_SPEED_MBPS:-10000} Mb/s found to $(worker_host 1). Cable the nodes on direct point-to-point subnets or lower FABRIC_MIN_SPEED_MBPS"
+  for rail in "${pairs[@]}"; do
+    read -r dev ip wdev wip mtu mtus <<<"$rail"
+    [[ -z "$filter_peer" || "$wip" == "$filter_peer" ]] || continue
+    [[ -z "$mtus" || "${mtus%%/*}" == "${mtus##*/}" ]] ||
+      warn "rail $dev ($ip) is MTU ${mtus%%/*} and $wdev ($wip) on $(worker_host 1) is MTU ${mtus##*/}: probing at $mtu"
+    ok=1
+    rail_ping "$dev" "$wip" "$mtu" || ok=0
+    (( ok == 0 )) || worker 1 "$(declare -f rail_ping); rail_ping $(printf '%q' "$wdev") $(printf '%q' "$ip") $mtu" || ok=0
+    if (( ok )); then
+      keep+=("$dev $ip $wdev $wip $mtu")
+      if (( first )); then
+        HEAD_ADDR=$ip; WORKER_ADDR=$wip; first=0
+      fi
+      if [[ "$dev" =~ ^mgbe([0-3])_0$ && "$wdev" =~ ^mgbe([0-3])_0$ && "$mtu" -ge 8256 ]]; then
+        zc_local+=("${BASH_REMATCH[1]}")
+        zc_worker+=("${wdev#mgbe}"); zc_worker[-1]="${zc_worker[-1]%_0}"
+      fi
+    else
+      warn "rail $dev ($ip) <-> $wdev ($wip) on $(worker_host 1) does not carry a $mtu-byte ping: leaving it out"
+    fi
+  done
+  (( ${#keep[@]} )) || die "no Ethernet rail between this node and $(worker_host 1) carries a full-size ping. Check cables, addresses and MTU"
+  LINK_KIND=tcp
+  HEAD_TCP_RAILS=${#keep[@]}
+  HEAD_HCAS=""; WORKER_HCAS=""; HEAD_GID=0; WORKER_GID=0
+  LINK_ZC_PORTS=$(IFS=,; echo "${zc_local[*]}")
+  WORKER_ZC_PORTS=$(IFS=,; echo "${zc_worker[*]}")
+  if [[ -n "${SOCKET_IFNAME:-}" ]]; then
+    HEAD_DEV=$SOCKET_IFNAME
+    WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk -v d="$SOCKET_IFNAME" '$1 == d { print $3 }' | paste -sd, -)
+    [[ -n "$WORKER_DEV" ]] || WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $3 }' | paste -sd, -)
+  else
+    HEAD_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $1 }' | paste -sd, -)
+    WORKER_DEV=$(printf '%s\n' "${keep[@]}" | awk '{ print $3 }' | paste -sd, -)
+  fi
+  [[ "$RDMA" != 1 ]] || warn "RDMA=1 but there is no RDMA verbs device on both nodes: using RDMA=0 (NCCL Socket TCP)"
+  RDMA=0
+  NODE_DEV=("$HEAD_DEV" "$WORKER_DEV"); NODE_HCAS=("" ""); NODE_GID=(0 0)
+  LINK_HEAD_ADDR[1]=$HEAD_ADDR; LINK_WORKER_ADDR[1]=$WORKER_ADDR
+  MASTER_ADDR=${MASTER_ADDR:-$HEAD_ADDR}
+  rail_tcp_buffers
+}
+
 # TP=2: HEAD_ADDR / HEAD_DEV / HEAD_HCA / HEAD_GID and WORKER_ADDR / WORKER_DEV / WORKER_HCA / WORKER_GID: the link the
 # two ranks talk over (NCCL and the rendezvous). FABRIC_PEER overrides the worker's link address when WORKER is reached
-# over another network.
+# over another network. On nodes without RDMA verbs (Jetson AGX Thor), falls back to multi-rail Ethernet discovery.
 detect_link() {
+  if ! rdma_present || { [[ -z "${WORKER_DOWN[1]:-}" ]] && ! worker 1 'ls -d /sys/class/infiniband/* >/dev/null 2>&1'; }; then
+    detect_link_tcp
+    return 0
+  fi
+  LINK_KIND=ib
   local peer=${FABRIC_PEER:-${WORKER#*@}} cx7
   # a host name (an /etc/hosts alias of the CX7 address, say) is resolved first: ``ip route get`` takes addresses only
   if [[ ! "$peer" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
@@ -272,7 +528,8 @@ detect_link() {
   for v in HEAD_HCA HEAD_GID WORKER_HCA WORKER_GID; do
     [[ "${!v}" != "-" ]] || die "no RoCE device or RoCE v2 GID for the link ($v): is $HEAD_DEV / $WORKER_DEV the CX7 port between the Sparks? Set FABRIC_PEER to the worker's CX7 address"
   done
-  NODE_DEV=("$HEAD_DEV" "$WORKER_DEV"); NODE_HCAS=("$HEAD_HCAS" "$WORKER_HCAS"); NODE_GID=("$HEAD_GID" "$WORKER_GID")
+  [[ "$RDMA" != auto ]] || RDMA=1
+  NODE_DEV=("${SOCKET_IFNAME:-$HEAD_DEV}" "${SOCKET_IFNAME:-$WORKER_DEV}"); NODE_HCAS=("$HEAD_HCAS" "$WORKER_HCAS"); NODE_GID=("$HEAD_GID" "$WORKER_GID")
   LINK_HEAD_ADDR[1]=$HEAD_ADDR; LINK_WORKER_ADDR[1]=$WORKER_ADDR
   MASTER_ADDR=${MASTER_ADDR:-$HEAD_ADDR}
 }
@@ -304,7 +561,18 @@ nccl_extra_collect() {
 
 nccl_env() {
   local dev=$1 hcas=$2 gid=$3
-  NCCL_ARGS=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_HCA=$hcas" -e "NCCL_IB_GID_INDEX=$gid")
+  if [[ "${LINK_KIND:-ib}" == tcp ]]; then
+    local nch=${NCCL_CHANNELS:-${HEAD_TCP_RAILS:-4}} has_min=0 has_max=0 x
+    NCCL_ARGS=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_DISABLE=1")
+    for x in "${NCCL_EXTRA_ENV[@]}"; do
+      [[ "$x" != NCCL_MIN_NCHANNELS=* ]] || has_min=1
+      [[ "$x" != NCCL_MAX_NCHANNELS=* ]] || has_max=1
+    done
+    (( has_min )) || NCCL_ARGS+=(-e "NCCL_MIN_NCHANNELS=$nch")
+    (( has_max )) || NCCL_ARGS+=(-e "NCCL_MAX_NCHANNELS=$nch")
+  else
+    NCCL_ARGS=(-e "NCCL_SOCKET_IFNAME=$dev" -e "NCCL_IB_HCA=$hcas" -e "NCCL_IB_GID_INDEX=$gid")
+  fi
   [[ -z "${NCCL_DEBUG:-}" ]] || NCCL_ARGS+=(-e "NCCL_DEBUG=$NCCL_DEBUG")
   local x; for x in "${NCCL_EXTRA_ENV[@]}"; do NCCL_ARGS+=(-e "$x"); done
   # the same arguments as one line for a remote shell: any word with a character outside [A-Za-z0-9_.,:=/@%+-] is
@@ -330,7 +598,7 @@ head_hf_mount() {
   have=$(docker volume inspect -f '{{index .Options "device"}} {{index .Options "o"}}' "$HEAD_NFS_VOLUME" 2>/dev/null || true)
   if [[ -z "$have" ]]; then
     docker volume create --driver local --opt type=nfs --opt device=":$NFS_PATH" \
-      --opt o="addr=$HEAD_NFS_SERVER,nfsvers=4.2,ro,nconnect=8,rsize=1048576,wsize=1048576,hard,timeo=600" "$HEAD_NFS_VOLUME" >/dev/null ||
+      --opt o="addr=$HEAD_NFS_SERVER,$NFS_OPTS" "$HEAD_NFS_VOLUME" >/dev/null ||
       die "could not create the docker volume $HEAD_NFS_VOLUME here"
   elif [[ "${have%% *}" != ":$NFS_PATH" || "$have" != *"addr=$HEAD_NFS_SERVER,"* ]]; then
     die "the docker volume $HEAD_NFS_VOLUME here is ${have%% *} from ${have#* }, not :$NFS_PATH from $HEAD_NFS_SERVER: remove it (docker volume rm $HEAD_NFS_VOLUME) or set HEAD_NFS_VOLUME / HEAD_NFS_SERVER"

@@ -1,0 +1,19 @@
+# cuda build: avoid emitting compute_110aa / sm_110aa when -Dsm includes an explicit 'a' suffix (e.g. -Dsm=110a on
+# Jetson AGX Thor) and a kernel sets arch_specific = true. Keeps -Dsm=121 and -Dsm=110 unchanged.
+diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
+--- a/zig/build/cuda.zig
++++ b/zig/build/cuda.zig
+@@ -248,9 +248,11 @@ fn fatbin(b: *std.Build, nvcc: []const u8, version: std.Build.LazyPath, k: Kerne
+     run.addFileInput(version);
+     run.addArgs(&torch_flags);
+     run.addArgs(k.flags);
+-    const a = if (k.arch_specific) "a" else "";
+     var it = std.mem.tokenizeScalar(u8, sms, ',');
+-    while (it.next()) |sm| run.addArg(b.fmt("-gencode=arch=compute_{s}{s},code=sm_{s}{s}", .{ sm, a, sm, a }));
++    while (it.next()) |sm| {
++        const a = if (k.arch_specific and !std.mem.endsWith(u8, sm, "a")) "a" else "";
++        run.addArg(b.fmt("-gencode=arch=compute_{s}{s},code=sm_{s}{s}", .{ sm, a, sm, a }));
++    }
+     run.addArgs(&.{ "-MD", "-MF" });
+     _ = run.addDepFileOutputArg2(b.fmt("{s}.d", .{k.name}), .{});
+     run.addArg("-o");
