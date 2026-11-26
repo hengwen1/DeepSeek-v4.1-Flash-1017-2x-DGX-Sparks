@@ -46,7 +46,7 @@ class ThorBuildTest(unittest.TestCase):
         for cc, want in [("11.0", "110a"), ("12.1", "121"), ("12.0", "120"), (None, "121")]:
             with self.subTest(cc=cc):
                 self.set_fake_nvidia_smi(cc)
-                code, out = self.bash_config('echo "$SM|$TAG_BASE|$KIT_SUB"')
+                code, out = self.bash_config('echo "$SM|$TAG_BASE|$KIT_SUB"', {"SM": "auto"})
                 self.assertEqual(code, 0, out)
                 sm, tag_base, kit_sub = out.strip().split("|")
                 self.assertEqual(sm, want)

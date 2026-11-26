@@ -293,7 +293,14 @@ if [[ "${LINK_KIND:-ib}" == tcp ]]; then
   ENGINE_ENV+=("TF_MGBE_ZC=$([[ "$MGBE_ZC" == on ]] && echo 1 || echo 0)")
   if [[ "$MGBE_ZC" == on ]]; then
     ENGINE_ENV+=("TF_MGBE_ZC_MAX_KB=$MGBE_ZC_MAX_KB" "TF_MGBE_ZC_EAGER_KB=$MGBE_ZC_EAGER_KB")
-    [[ -z "$MGBE_ZC_CPUS" ]] || ENGINE_ENV+=("TF_MGBE_ZC_CPUS=$MGBE_ZC_CPUS")
+    _zc_cpus="$MGBE_ZC_CPUS"
+    if [[ "$_zc_cpus" == auto ]]; then
+      _ncpu=$(nproc 2>/dev/null || echo 0)
+      if (( _ncpu >= 8 )); then _zc_cpus="4,5,6,7"; else _zc_cpus=""; fi
+    elif [[ "$_zc_cpus" == off || "$_zc_cpus" == none ]]; then
+      _zc_cpus=""
+    fi
+    [[ -z "$_zc_cpus" ]] || ENGINE_ENV+=("TF_MGBE_ZC_CPUS=$_zc_cpus")
   fi
 fi
 while IFS='=' read -r name _; do ENGINE_ENV+=("$name=${!name}"); done < <(env | grep -E '^(TENSORFOLD|TF_DS|TF_SPILL|TF_FILL|TF_MGBE_ZC)_[A-Z0-9_]+=' | grep -vE '^TF_DS_(REPLAY_FLOOR|STREAMS|POOL|WINDOW|ROUND_ROWS|GRAPHS|GRAPH_CAP|HC_SIDE|L2_PREFETCH|ENGRAM_AIO|RANK_CACHE|KIT|ENGRAM|TOKEN_MAP)=' | grep -vE '^TF_MGBE_ZC_(MAX_KB|EAGER_KB|PORTS|CPUS)=' | grep -vE "^(${PORT_MAPPED_RE:-^$})=" || true)

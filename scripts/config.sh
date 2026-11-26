@@ -184,7 +184,7 @@ MGBE_ZC_GROUP="${MGBE_ZC_GROUP:-mgbe_zc}"      # host group owning /dev/mgbe_zc 
 MGBE_ZC_MAX_KB="${MGBE_ZC_MAX_KB:-20480}"      # TF_MGBE_ZC_MAX_KB: max shard per rank (20 MiB covers full 2048-row prefill chunk)
 MGBE_ZC_EAGER_KB="${MGBE_ZC_EAGER_KB:-32}"     # TF_MGBE_ZC_EAGER_KB: per-rail eager (VDMA 2) vs DDP (VDMA 3) threshold
 MGBE_ZC_PORTS="${MGBE_ZC_PORTS:-}"             # TF_MGBE_ZC_PORTS: comma list of MGBE port indices (default: auto from live rails)
-MGBE_ZC_CPUS="${MGBE_ZC_CPUS:-}"               # TF_MGBE_ZC_CPUS: optional CPU affinity per rail worker (e.g. 2,3,4,5)
+MGBE_ZC_CPUS="${MGBE_ZC_CPUS:-auto}"           # TF_MGBE_ZC_CPUS: CPU affinity per rail worker (auto: 4,5,6,7 when >=8 CPUs; off: unpinned)
 # zig/patches/0010: the RDMA proxy naps once quiet for RDMA_IDLE_S seconds, RDMA_NAP_US between looks. 0 keeps the
 # always-spinning proxy (the stock engine's behavior). A decode round's gathers never see a nap.
 RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds

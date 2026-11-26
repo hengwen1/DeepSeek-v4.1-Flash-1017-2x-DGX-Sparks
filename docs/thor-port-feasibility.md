@@ -1,28 +1,36 @@
 # Porting this recipe to 2× Jetson AGX Thor (`sm_110a` + `/dev/mgbe_zc`)
 
-**Status:** Phases 1–5 implemented and live-validated on `thor` ↔ `thor2` (2026-11-25, branch `jthor_zc`); Phase 6 (`sm_110a` tuning) next.
-**Verdict:** proven live. The pinned kit (`KIT_REF=abe07c7d`) converts cleanly to `sm_110a` via `scripts/retarget_kit.py` (preserving all 147 PDL variants), the engine builds natively for `-Dsm=110a` (`0069`), boots on both NCCL Socket TCP (`MGBE_ZC=off`) and 4-rail `/dev/mgbe_zc` (`0070`, `MGBE_ZC=on`, bit-identical), passes `tools/smoke.py` and 6/6 needle checks, and delivers **+83% to +208%** decode speedup (**38.1–39.6 tok/s** 1-stream, **74.8 tok/s** 4-stream aggregate) and **+50% to +67%** prefill speedup (**1,051 tok/s** at 32k) over NCCL Socket TCP with 0 `mmc_rx_fifo_overflow`.
+**Status:** Phases 1–6 implemented and live-validated on `thor` ↔ `thor2` (2026-11-25, branch `jthor_zc`).
+**Verdict:** proven live and tuned. The pinned kit (`KIT_REF=abe07c7d`) converts cleanly to `sm_110a` via `scripts/retarget_kit.py` (preserving all 233 PDL variants), the engine builds natively for `-Dsm=110a` (`0069`), boots on both NCCL Socket TCP (`MGBE_ZC=off`) and 4-rail `/dev/mgbe_zc` (`0070`, `MGBE_ZC=on`), and adds Thor `sm_110a` kernel & wire tuning (`0071`). With Phases 5 + 6 active, the Thor pair passes `tools/smoke.py` and 8k/32k/128k needle checks with **0 errors**, **0 `mmc_rx_fifo_overflow`**, and **0 extra VRAM**, reaching **45.34 tok/s** 1-stream decode (**+117%** vs NCCL TCP, **+18.9%** vs Phase 5), **62.84 tok/s** 2-stream aggregate (**32.64 tok/s**/stream), **75.60 tok/s** 4-stream aggregate, and **1,332.5 tok/s** 32k prefill (**1,257 tok/s** at 128k, **+112%** vs NCCL TCP, **+27–35%** vs Phase 5).
 
 ---
 
-## 0. Live Validation Results (Phases 1–5, 2026-11-25)
+## 0. Live Validation Results (Phases 1–6, 2026-11-25)
 
 * **Microbenchmark (`tf-dsv41-rdma-bench ... mgbe_zc`, 4 rails, 50-gather PDL CUDA Graphs):** `bad=0`, `bad_into=0`, 0 `mmc_rx_fifo_overflow` delta:
   * 1 row (10 KiB, eager): **12.94 µs**; 6 rows (60 KiB, eager): **19.36 µs**; 16 rows (160 KiB, DDP): **42.96 µs**; 512 rows (5 MiB, DDP): **550.43 µs** (~76 Gbps uni); 2048 rows (20 MiB, DDP): **2.36 ms**.
-* **Boot & memory:** Warm load **26.3 s** (API ready in **32 s**); `dsv41: mgbe_zc ring active (2 ranks, 4 rail(s), slots up to 20480 KiB)`; post-load headroom **10.1 GiB** (`thor`) / **12.8 GiB** (`thor2`).
-* **Correctness:** `tools/smoke.py` 100% PASS; `tools/bench.py` needle 8k & 32k 6/6 CORRECT; greedy SHA-256 (`MGBE_ZC=on` vs `MGBE_ZC=off`, `short_math`, `short_think`, `prefill_2k`, `prefill_6k`): **4/4 IDENTICAL**.
+* **Boot & memory:** Warm load **26.3 s** (cold **97.5 s**); `dsv41: mgbe_zc ring active (2 ranks, 4 rail(s), slots up to 20480 KiB)`; `dsv41: sm110a tuning (thor=true): moe_tail=true decode8=true prefill_cublas=true shard_head=true pair_sum=true`; `TF_MGBE_ZC_CPUS=4,5,6,7`; post-load headroom **10.1 GiB** (`thor`) / **12.8 GiB** (`thor2`) (**9.7 / 12.0 GiB** after 128k context).
+* **Correctness:** `tools/smoke.py` 100% PASS; `tools/bench.py` needle 8k, 32k, and 128k all CORRECT with identical `token_sha` (`bbf8c954a93b`); greedy 256-tok decode `token_sha` (`0f735bb9f7f2`, `790719b68d8d`) identical across Phase 5 and Phase 6; Phase 5 vs Phase 4 greedy SHA-256 (`short_math`, `short_think`, `prefill_2k`, `prefill_6k`): **4/4 IDENTICAL**; `mmc_rx_fifo_overflow` delta == **0** on all 8 MGBE interfaces across both nodes.
 * **A/B benchmark (`tools/bench.py --salt thor-ab-1`, 0 errors):**
 
-| Metric | `MGBE_ZC=off` (4-rail NCCL TCP) | `MGBE_ZC=on` (4-rail `/dev/mgbe_zc`) | Gain |
-| --- | ---: | ---: | ---: |
-| Decode (1 stream, 256 tok) | 20.88 tok/s (TTFT 0.38 s) | **38.13 tok/s** (TTFT 0.26 s) | **+82.6%** |
-| Multi ×1 | 18.42 tok/s | **39.60 tok/s** | **+114.9%** |
-| Multi ×2 aggregate (per-stream) | 18.42 (9.53) tok/s | **56.66 (28.96) tok/s** | **+207.6%** |
-| Multi ×4 aggregate (per-stream) | 28.78 (8.02) tok/s | **74.81 (19.71) tok/s** | **+159.9%** |
-| Prefill 2k (`1,930` tok) | 556.56 tok/s (3.47 s) | **832.37 tok/s** (2.32 s) | **+49.6%** |
-| Prefill 8k (`7,683` tok) | 623.49 tok/s (12.32 s) | **1,005.74 tok/s** (7.64 s) | **+61.3%** |
-| Prefill 32k (`30,680` tok) | 629.79 tok/s (48.73 s) | **1,051.28 tok/s** (29.18 s) | **+66.9%** |
+| Metric | Phase 4: NCCL TCP (`MGBE_ZC=off`) | Phase 5: `/dev/mgbe_zc` (`0070`) | Phase 6: `mgbe_zc` + `sm_110a` (`0071`) | Ph6 vs Ph5 | Ph6 vs Ph4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Decode (1 stream, 256 tok) | 20.88 tok/s (TTFT 0.38 s) | 38.13 tok/s (TTFT 0.26 s) | **45.34 tok/s** (TTFT 0.26 s) | **+18.9%** | **+117.2%** |
+| Multi ×1 | 18.42 tok/s | 39.60 tok/s | **43.46 tok/s** | **+9.7%** | **+135.9%** |
+| Multi ×2 aggregate (per-stream) | 18.42 (9.53) tok/s | 56.66 (28.96) tok/s | **62.84 (32.64) tok/s** | **+10.9%** (+12.7%) | **+241.1%** |
+| Multi ×4 aggregate (per-stream) | 28.78 (8.02) tok/s | 74.81 (19.71) tok/s | **75.60 (19.97) tok/s** | **+1.1%** (+1.3%) | **+162.7%** |
+| Prefill 2k (`~2,000` tok) | 556.56 tok/s (3.47 s) | 832.37 tok/s (2.32 s) | **1,120.83 tok/s** (1.77 s) | **+34.7%** | **+101.4%** |
+| Prefill 8k (`~7,860` tok) | 623.49 tok/s (12.32 s) | 1,005.74 tok/s (7.64 s) | **1,307.28 tok/s** (6.02 s) | **+30.0%** | **+109.7%** |
+| Prefill 32k (`~31,400` tok) | 629.79 tok/s (48.73 s) | 1,051.28 tok/s (29.18 s) | **1,332.50 tok/s** (23.56 s) | **+26.8%** | **+111.6%** |
+| Needle 8k / 32k / 128k | — | 8k 3/3 (7.86 s), 32k 3/3 (29.34 s) | **8k 1/1 (6.16 s), 32k 1/1 (23.59 s), 128k 1/1 (97.58 s, 1,257 tok/s)** | **−21.6% / −19.6% TTFT** | — |
 
+* **Phase 6 (`0071-dsv41-sm110a-tuning.patch`) design findings:**
+  * Live phase profiling (`tf-dsv41-lanes --profile 2`) showed MoE dominated both prefill (54.9%) and decode (51.1%), followed by dense EXL3 attention prefill (20.4%) and gathers (10.5% prefill / 4.5% decode).
+  * **Why `grouped_mma_tail` beat `tcgen05` on DeepSeek-V4.1 MoE prefill:** with 384 routed experts and `top_k = 6`, a 2048-token chunk averages only ~32 tokens/expert (~170 FLOP/byte at 3-bit), making MoE prefill **DRAM-bandwidth & latency bound** on Thor (256.3 GB/s measured). A prototype `tcgen05` kernel was accurate (`max_err = 2.67e-5`) but ran 39.9 ms/layer due to 2-stage stalls and `N=128` padding, whereas 3-stage `cp.async` tail-split `grouped_mma_tail` (`ROWS=16/32/64`, 128c, `decode_smem_direct`) hit **15.97 ms/layer GU + 8.96 ms/layer DN** (**1.87×** faster than stock).
+  * **Dense EXL3 prefill (`prefill_cublas`):** cuBLAS FP16→FP32 GEMM (leveraging `tcgen05` inside cuBLAS) + fused FWHT128/`svh` epilogue reuses idle `ch.xs.z` (280 MiB, 0 extra VRAM).
+  * **Decode (`decode8` + `shard_head` + `MGBE_ZC_CPUS=auto` → `4,5,6,7`):** transposed 5-block/SM `decode8` (`r <= 8`, bit-exact 0 diffs vs stock, 1.21–1.23× MoE speedup) + sharded greedy LM-head argmax (`shard_head`, 32 B wire exchange) + pinning the 4 `mgbe_zc` polling threads off CPU 0 (where MGBE VDMA 0/1 IRQs land).
+  * **Wire reduction (`pair_sum`):** bit-exact `engramPairSum` and `hcPairGather` (3/4 wire bytes) over `mgbe_zc` for `n >= 256`.
+  * All `sm_110a` paths gate on runtime `cc_major == 11` (with `TF_DS_SM110_*` / `TF_MGBE_ZC_PAIR_SUM` switches) and compile cleanly for both `sm_110a` and `sm_121`.
 * **Operational notes found during bring-up:**
   * Thor's kernel NFS daemon serves NFSv3 (`+3`) only → `NFS_OPTS='vers=3,ro,rsize=1048576,wsize=1048576,hard,timeo=600'` in `scripts/local.sh`.
   * `hf_xet` derives download buffers from total RAM (~7.8 GiB on 122 GiB Thor), which OOMs if another server is resident; capping via `HF_XET_DISABLE_MEMORY_DERIVED_DOWNLOAD_BUFFERS=1` + `HF_XET_RECONSTRUCTION_DOWNLOAD_BUFFER_LIMIT=268435456` keeps RSS at ~322 MiB.
@@ -302,7 +310,7 @@ the vision tower) and general SM121 AOT records for non-div-16 tile counts.
 | Docker build & image identity | **open, small** | Add `SM` to `image_hash()` & `tf.sm` label, pass `--build-arg SM` (prevents GHCR/local `sm_121` collision); drop `-Dnvcc` from `INPUTS_REF` CPU-only build; include `sm=$SM` in `prepared_state()` |
 | Launcher (GPU runtime, rails, NFS) | **open, small** | Port GLM-5.3's `detect_sm`, `gpu_args`, `cuda_compat_args`, `fabric_pairs`, `rail_tcp_buffers`; gate `--device /dev/infiniband` on existence; wire `/dev/mgbe_zc` + GID; make `NFS_OPTS` configurable (verify NFSv4.2 vs `vers=3` on Tegra 6.8.12) |
 | Weights & disk | **not started** | Head: ~505 GB (196 GiB checkpoint + ~203 GB Engram + ~106 GB rank0). **`thor2`: ~310 GB** (~203 GB `WORKER_ENGRAM_DIR` + ~106 GB `WORKER_CACHE_DIR`); reuse existing 1017 Engram shards via `HEAD_ENGRAM_DIR`/`WORKER_ENGRAM_DIR` if present |
-| sm_110a kernel tuning | **optional (Phase 6)** | `t5000` decode kernels (`decode8`, `shard-head`) + GLM `0019` `tcgen05` (`sm_110a`) EXL3 MoE prefill |
+| sm_110a kernel tuning | **done (Phase 6)** | `0071-dsv41-sm110a-tuning.patch`: tail-split `cp.async` MoE prefill (`ROWS=16/32/64`), `decode8` (`r<=8`), cuBLAS FP16→FP32 dense EXL3 prefill (reusing `ch.xs.z`), `shard_head` greedy argmax, `mgbe_zc` `pair_sum`, and `MGBE_ZC_CPUS=auto` (`4,5,6,7`) |
 
 ---
 
